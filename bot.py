@@ -86,7 +86,7 @@ def message(day, group, confirmed, spans, unknown, updated, changed=False):
     lines = [
         "🔄 <b>Изменение суточного графика</b>" if changed else
         "⚡️ <b>Суточный график</b>",
-        f"📆 {day:%d.%m.%Y} — черга {html.escape(group.removeprefix('GPV'))}",
+        f"📆 {day:%d.%m.%Y} — Черга {html.escape(group.removeprefix('GPV'))}",
     ]
     for mode, heading in (("off", "🔴 Плановые отключения:"),
                           ("maybe", "🟠 Возможные отключения:")):
@@ -111,8 +111,9 @@ def weekly_message(week_start, group, entries, changed=False):
         f"Черга {html.escape(group.removeprefix('GPV'))} · "
         f"{week_start:%d.%m}–{week_end:%d.%m.%Y}",
     ]
+    names = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
     for day, spans in entries:
-        lines.append(f"\n<b>{day:%a %d.%m}</b>")
+        lines.append(f"\n<b>{names[day.weekday()]} {day:%d.%m}</b>")
         lines.extend(f"• {clock(a)}–{clock(b)}" for a, b in spans)
     lines.append("\n⚠️ Это только предварительный прогноз, не суточный график.")
     lines.append(f'<a href="{SOURCE}">Источник: ДТЭК</a>')
@@ -157,7 +158,7 @@ def collect_notifications(source, group, today):
         # A table made entirely of white cells means no planned outage.
         if unknown or not spans:
             continue
-        key = f"day:{day.isoformat()}:{group}"
+        key = f"{day.isoformat()}:{group}"
         payload = (day.isoformat(), group, True, spans, unknown)
         out.append((key, payload, "day", (day, spans, source.fact.update)))
 
