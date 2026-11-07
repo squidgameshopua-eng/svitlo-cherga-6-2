@@ -1,0 +1,47 @@
+name: Check DTEK schedule
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *'
+permissions:
+  contents: write
+concurrency:
+  group: dtek-outage-monitor
+  cancel-in-progress: false
+jobs:
+  check:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.BOT_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Install Chromium for DTEK WAF fallback
+        run: python -m playwright install --with-deps chromium
+      - name: Read DTEK and notify Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DTEK_GROUP: ${{ vars.DTEK_GROUP || '6.2' }}
+          DTEK_WAF_BROWSER: "1"
+          STATE_PATH: bot_state.json
+        run: python bot.py --once
+      - name: Save notification state
+        if: success()
+        run: |
+          if [[ -f bot_state.json ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -f bot_state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Store notification state [skip ci]"
+              git push
+            fi
+          fi
