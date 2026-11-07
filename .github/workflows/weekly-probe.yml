@@ -1,0 +1,21 @@
+name: One-time independent weekly DTEK report
+on:
+  push:
+    paths:
+      - .github/workflows/weekly-probe.yml
+      - scripts/weekly_probe.py
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - run: python scripts/weekly_probe.py
