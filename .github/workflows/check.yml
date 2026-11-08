@@ -31,6 +31,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DTEK_GROUP: ${{ vars.DTEK_GROUP || '6.2' }}
           DTEK_WAF_BROWSER: "1"
+          ANNOUNCEMENTS_ENABLED: ${{ vars.ANNOUNCEMENTS_ENABLED || 'true' }}
+          DTEK_ADDRESS_JSON: ${{ secrets.DTEK_ADDRESS_JSON }}
           STATE_PATH: bot_state.json
         run: python bot.py --once
       - name: Save notification state
