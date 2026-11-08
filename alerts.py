@@ -312,7 +312,7 @@ def address_decision(entry, state, now, expected="GPV6.2"):
             }, address_message(event, changed=isinstance(old, dict) and
                                old.get("status") == "active")))
     elif isinstance(old, dict) and old.get("status") == "active":
-        msg = address_clear_message({"end": old.get("end", "")}, now)
+        msg = address_clear_message({"end": old.get("end") or (old.get("event") or {}).get("end", "")}, now)
         result.append(("address", key, {"status": "inactive"}, msg))
     # Group changes need human attention. Do not broadcast initial group assignment.
     previous = state.get("address:groups")
