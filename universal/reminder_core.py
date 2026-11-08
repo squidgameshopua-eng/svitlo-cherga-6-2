@@ -207,9 +207,15 @@ def _upsert_job(db, sub_id, local_day, start_at, minutes):
         VALUES (?,?,?,?,'pending')
         ON CONFLICT(subscription_id,local_day,start_at)
         DO UPDATE SET due_at=excluded.due_at,
-                      status=CASE WHEN reminders.status='sent' THEN 'sent'
+                      status=CASE WHEN reminders.status IN ('sent','leased')
+                                      THEN reminders.status
                                   ELSE 'pending' END,
-                      lease_until=NULL,retry_after=NULL
+                      lease_until=CASE WHEN reminders.status='leased'
+                                           THEN reminders.lease_until
+                                       ELSE NULL END,
+                      retry_after=CASE WHEN reminders.status='leased'
+                                           THEN reminders.retry_after
+                                       ELSE NULL END
     """, (sub_id, local_day, start_at, due))
 
 
