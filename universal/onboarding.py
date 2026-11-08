@@ -6,20 +6,25 @@ getChatMember before calling confirm_address or callback_choice.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Callable
 
 from universal.reminder_core import (
     choose_lead, inline_choice_keyboard, lease_due, mark_failed,
-    mark_sent, parse_choice, register, reminder_text, subscription_for_chat,
+    mark_sent, parse_preference_action, register, reminder_text,
+    selected_leads, set_leads, subscription_for_chat, unix_utc,
 )
 
 
 PROMPT = (
     "✅ Адресу збережено.\n"
     "⏰ Чи нагадувати перед плановим відключенням електроенергії?\n"
-    "Це додаткове нагадування. Повідомлення про новий графік,"
-    " зміни та скасування залишаються увімкненими."
+    "За замовчуванням нагадування ВИМКНЕНО.\n"
+    "Позначте потрібний час або кілька варіантів. "
+    "Натисніть «Зберегти вибір».\n"
+    "Кожна позначка — окреме нагадування.\n"
+    "Повідомлення про графік, зміни та скасування працюють незалежно."
 )
 
 
@@ -53,9 +58,18 @@ def confirm_address(
         "method": "sendMessage",
         "chat_id": configuration_chat_id or recipient_chat_id,
         "text": PROMPT,
-        "reply_markup": inline_choice_keyboard(sub_id),
+        "reply_markup": inline_choice_keyboard(sub_id, selected_leads(db, sub_id)),
         "subscription_id": sub_id,
     }
+
+
+def _draft_choices(db, subscription_id: int, actor_id: str):
+    draft = db.execute("""
+        SELECT choices FROM reminder_drafts
+        WHERE subscription_id=? AND actor_id=?
+    """, (subscription_id, actor_id)).fetchone()
+    return (tuple(json.loads(draft["choices"])) if draft else
+            selected_leads(db, subscription_id))
 
 
 def callback_choice(
@@ -65,42 +79,82 @@ def callback_choice(
     is_admin_of_destination: Callable[[str, str], bool],
     now: datetime,
 ):
-    """Validate inline choice against target chat and current administrator.
+    """Process checkbox choices securely; default reminders OFF.
 
-    A callback's origin may be the ADMIN'S private chat, while the subscription
-    belongs to a CHANNEL. Always find the target from the DB, never trust a
-    target_chat_id supplied in callback payload.
+    A channel's subscriber chat_id comes from the DB. Never trust callback
+    origin or callback content as authorization to edit a channel/group.
     """
-    sub_id, lead = parse_choice(callback_data)
+    action, sub_id, lead = parse_preference_action(callback_data)
     row = db.execute("""
         SELECT d.chat_id,d.chat_kind,d.owner_user_id
-        FROM subscriptions s
-        JOIN destinations d ON d.id=s.destination_id
+        FROM subscriptions s JOIN destinations d ON d.id=s.destination_id
         WHERE s.id=?
     """, (sub_id,)).fetchone()
     if row is None:
         raise PermissionError("Підписку не знайдено")
     chat = row["chat_id"]
     if row["chat_kind"] == "private":
-        authorized = row["owner_user_id"] == acting_user_id and chat == acting_user_id
+        authorized = (row["owner_user_id"] == acting_user_id
+                      and chat == acting_user_id)
     else:
-        authorized = is_admin_of_destination(chat, acting_user_id)
-    choose_lead(
-        db, subscription_id=sub_id, chat_id=chat,
-        actor_is_authorized=authorized, minutes=lead, now=now,
+        authorized = bool(is_admin_of_destination(chat, acting_user_id))
+    if not authorized:
+        raise PermissionError("Налаштування може змінювати лише адміністратор")
+
+    choices = _draft_choices(db, sub_id, acting_user_id)
+    if action == "toggle":
+        selection = set(choices)
+        if lead in selection:
+            selection.remove(lead)
+        else:
+            selection.add(lead)
+        choices = tuple(sorted(selection, reverse=True))
+        db.execute("""
+            INSERT INTO reminder_drafts(subscription_id,actor_id,choices,updated_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(subscription_id,actor_id)
+            DO UPDATE SET choices=excluded.choices,updated_at=excluded.updated_at
+        """, (sub_id, acting_user_id, json.dumps(choices), unix_utc(now)))
+        return {
+            "chat_id": chat, "subscription_id": sub_id,
+            "chosen_minutes": None, "pending_minutes": choices,
+            "reply_markup": inline_choice_keyboard(sub_id, choices),
+            "confirmation": "Позначки оновлено. Натисніть «Зберегти вибір».",
+        }
+    if action == "off":
+        choices = ()
+    elif action == "legacy":
+        choices = () if lead == 0 else (lead,)
+    elif action != "save":
+        raise ValueError("Невідома дія")
+
+    # Saving is explicit. An untouched or empty draft keeps reminders OFF.
+    set_leads(db, subscription_id=sub_id, chat_id=chat,
+              actor_is_authorized=True, minutes=choices, now=now)
+    db.execute(
+        "DELETE FROM reminder_drafts WHERE subscription_id=? AND actor_id=?",
+        (sub_id, acting_user_id),
     )
-    if lead == 0:
-        text = ("✅ Нагадування вимкнено.\n"
-                "Сповіщення про графік, його зміни та скасування залишаються.")
-    else:
-        title = "1 годину" if lead == 60 else f"{lead} хвилин"
-        text = (
-            f"✅ Нагадування налаштовано: за {title} до кожного "
-            "підтвердженого планового відключення.\n"
-            "Зміни графіка та скасування надходитимуть окремо."
+    if not choices:
+        confirmation = (
+            "✅ Нагадування вимкнено.\n"
+            "Повідомлення про графік, зміни та скасування залишаються."
         )
-    return {"chat_id": chat, "subscription_id": sub_id,
-            "chosen_minutes": lead, "confirmation": text}
+    else:
+        formats = ["1 годину" if minute == 60 else f"{minute} хвилин"
+                   for minute in sorted(choices, reverse=True)]
+        confirmation = (
+            "✅ Нагадування налаштовано: " +
+            ", ".join(f"за {value}" for value in formats) + ".\n"
+            "Це додаткові нагадування до підтверджених відключень."
+        )
+    return {
+        "chat_id": chat, "subscription_id": sub_id,
+        "chosen_minutes": choices[0] if len(choices) == 1 else 0 if not choices else None,
+        "pending_minutes": choices,
+        "reply_markup": inline_choice_keyboard(sub_id, choices),
+        "confirmation": confirmation,
+    }
 
 
 def send_due_batch(db, send_message, now: datetime, batch=20):
