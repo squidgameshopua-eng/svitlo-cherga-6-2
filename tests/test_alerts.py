@@ -203,3 +203,25 @@ def test_change_of_house_group_only_after_baseline():
     result=address_decision(house(groups=["GPV5.1"]),state,NOW)
     assert any("змінив чергу" in x[3] for x in result if x[3])
     assert all("Кропивницького" not in x[3] for x in result if x[3])
+
+
+def test_public_state_never_contains_address_response_reason():
+    item=house(reason="Планові роботи за приватною адресою 67/А",kind="1",
+               start="08.11.2026 17:00",end="08.11.2026 20:00")
+    state={}
+    result=address_decision(item,state,NOW)
+    alerts=[x for x in result if x[1]=="address:last_outage"]
+    assert len(alerts)==1
+    data=alerts[0][2]
+    assert "event" not in data
+    assert "reason" not in data
+    assert "address" not in data
+    assert "67/А" not in str(data)
+    assert "67/А" not in str(alerts[0][3])
+    assert "Причина: планові роботи" in alerts[0][3]
+
+
+def test_group_mismatch_at_first_verified_read_gets_warning():
+    state={}
+    result=address_decision(house(groups=["GPV5.1"]),state,NOW)
+    assert any(x[1]=="address:groups" and x[3] for x in result)
