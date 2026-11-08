@@ -47,6 +47,11 @@ def confirm_address(
     """
     if not authorized:
         raise PermissionError("Адресу може налаштовувати лише власник або адміністратор")
+    if recipient_kind == "private" and recipient_chat_id != actor_id:
+        raise PermissionError("Не можна налаштовувати чужий особистий чат")
+    if recipient_kind in ("group", "supergroup", "channel"):
+        if configuration_chat_id is not None and configuration_chat_id != actor_id:
+            raise PermissionError("Налаштування іншого чату доступні лише особисто адміністратору")
     required = {"operator", "oblast", "settlement", "street", "building"}
     if not isinstance(address, dict) or not required.issubset(address):
         raise ValueError("Адреса не пройшла перевірку оператора")
