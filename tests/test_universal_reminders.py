@@ -210,7 +210,7 @@ def test_wrong_admin_or_foreign_chat_cannot_modify_settings():
                     actor_is_authorized=True, minutes=60, now=NOW)
     assert db.execute(
         "SELECT lead_minutes FROM subscriptions WHERE id=?", (sub,)
-    ).fetchone()[0] is None
+    ).fetchone()[0] == 0
 
 
 def test_pause_cancels_pending_reminders():
