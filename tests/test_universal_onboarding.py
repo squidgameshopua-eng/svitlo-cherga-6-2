@@ -27,7 +27,7 @@ def test_first_address_wizard_shows_five_buttons():
     )
     assert prompt["chat_id"]=="123"
     assert "Адресу збережено" in prompt["text"]
-    assert len(prompt["reply_markup"]["inline_keyboard"])==5
+    assert len(prompt["reply_markup"]["inline_keyboard"])==6
     assert [x[0]["callback_data"].split(":")[-1]
             for x in prompt["reply_markup"]["inline_keyboard"]]==[
         "0","5","15","30","60",
@@ -123,3 +123,75 @@ def test_worker_only_marks_sent_after_success():
     assert send_due_batch(db,success,due+timedelta(seconds=46))==1
     assert send_due_batch(db,success,due+timedelta(seconds=47))==0
     assert db.execute("SELECT status FROM reminders").fetchone()[0]=="sent"
+
+
+def test_checkbox_selected_draft_does_not_change_default_until_saved():
+    db=connect()
+    prompt=confirm_address(
+        db,recipient_chat_id="123",recipient_kind="private",
+        actor_id="123",authorized=True,address=ADDRESS,queue_code="6.2",
+    )
+    sub=prompt["subscription_id"]
+    state=callback_choice(db,callback_data=f"toggle:{sub}:15",
+                          acting_user_id="123",
+                          is_admin_of_destination=lambda *_:False,now=NOW)
+    assert state["pending_minutes"]==(15,)
+    assert state["reply_markup"]["inline_keyboard"][1][0]["text"]=="☑ За 15 хвилин"
+    assert db.execute("SELECT lead_minutes FROM subscriptions WHERE id=?",
+                      (sub,)).fetchone()[0]==0
+    assert db.execute("SELECT COUNT(*) FROM reminder_leads").fetchone()[0]==0
+
+    state=callback_choice(db,callback_data=f"toggle:{sub}:5",
+                          acting_user_id="123",
+                          is_admin_of_destination=lambda *_:False,now=NOW)
+    assert state["pending_minutes"]==(15,5)
+    state=callback_choice(db,callback_data=f"save:{sub}",
+                          acting_user_id="123",
+                          is_admin_of_destination=lambda *_:False,now=NOW)
+    assert state["pending_minutes"]==(15,5)
+    assert db.execute("SELECT COUNT(*) FROM reminder_leads").fetchone()[0]==2
+    assert "за 15 хвилин" in state["confirmation"]
+    assert "за 5 хвилин" in state["confirmation"]
+
+
+def test_do_nothing_is_off_and_explicit_off_unsets_checkboxes():
+    db=connect()
+    sub=confirm_address(
+        db,recipient_chat_id="123",recipient_kind="private",
+        actor_id="123",authorized=True,address=ADDRESS,queue_code="6.2",
+    )["subscription_id"]
+    assert db.execute("SELECT lead_minutes FROM subscriptions WHERE id=?",
+                      (sub,)).fetchone()[0]==0
+    callback_choice(db,callback_data=f"toggle:{sub}:60",
+                    acting_user_id="123",
+                    is_admin_of_destination=lambda *_:False,now=NOW)
+    output=callback_choice(db,callback_data=f"off:{sub}",
+                           acting_user_id="123",
+                           is_admin_of_destination=lambda *_:False,now=NOW)
+    assert output["pending_minutes"]==()
+    assert "Нагадування вимкнено" in output["confirmation"]
+
+
+def test_multiple_checkboxes_create_independent_jobs():
+    db=connect()
+    sub=confirm_address(
+        db,recipient_chat_id="123",recipient_kind="private",
+        actor_id="123",authorized=True,address=ADDRESS,queue_code="6.2",
+    )["subscription_id"]
+    for minutes in (5,15,30):
+        callback_choice(db,callback_data=f"toggle:{sub}:{minutes}",
+                        acting_user_id="123",
+                        is_admin_of_destination=lambda *_:False,now=NOW)
+    callback_choice(db,callback_data=f"save:{sub}",
+                    acting_user_id="123",
+                    is_admin_of_destination=lambda *_:False,now=NOW)
+    start=NOW+timedelta(hours=2)
+    publish_confirmed_starts(db,location_id=1,queue_code="6.2",
+                             day=NOW.date(),starts=[start],now=NOW)
+    rows=db.execute(
+        "SELECT lead_minutes,due_at FROM reminders ORDER BY lead_minutes"
+    ).fetchall()
+    assert len(rows)==3
+    assert [r["lead_minutes"] for r in rows]==[5,15,30]
+    for row in rows:
+        assert row["due_at"]==int(start.timestamp())-row["lead_minutes"]*60
