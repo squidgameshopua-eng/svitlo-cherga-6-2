@@ -87,6 +87,7 @@ def test_two_addresses_two_chats_independent_preferences():
                                  day=DAY, starts=[start], now=NOW)
     jobs = lease_due(db, start - timedelta(minutes=30))
     assert len(jobs) == 1 and jobs[0]["chat_id"] == "200"
+    mark_sent(db, jobs[0]["id"])
     jobs = lease_due(db, start - timedelta(minutes=5))
     assert len(jobs) == 1 and jobs[0]["chat_id"] == "100"
 
