@@ -228,7 +228,9 @@ def send_due_batch(db, send_message, now: datetime, batch=20):
             for job in entries:
                 mark_failed(db, job["id"], now, retry_seconds=2)
             continue
-        labels = tuple(dict.fromkeys(item["label"] for item in entries))
+        labels = tuple(dict.fromkeys(
+            f"{item['label']} · №{item['subscription_id']}" for item in entries
+        ))
         if len(labels) == 1:
             text = reminder_text(entries[0], now)
         else:
