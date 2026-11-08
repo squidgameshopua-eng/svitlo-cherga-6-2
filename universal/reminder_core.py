@@ -64,6 +64,13 @@ def connect(filename=":memory:") -> sqlite3.Connection:
             start_at INTEGER NOT NULL,
             PRIMARY KEY (location_id, queue_code, local_day, start_at)
         );
+        CREATE TABLE IF NOT EXISTS reminder_drafts (
+            subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+            actor_id TEXT NOT NULL,
+            choices TEXT NOT NULL DEFAULT '[]',
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(subscription_id, actor_id)
+        );
         CREATE TABLE IF NOT EXISTS reminders (
             id INTEGER PRIMARY KEY,
             subscription_id INTEGER NOT NULL REFERENCES subscriptions(id),
@@ -368,18 +375,49 @@ def reminder_text(job, now: datetime) -> str:
     )
 
 
-def inline_choice_keyboard(subscription_id: int):
-    """Callback IDs are short and scoped to an existing subscription."""
-    options = (
-        ("Не нагадувати", 0), ("За 5 хвилин", 5),
-        ("За 15 хвилин", 15), ("За 30 хвилин", 30),
-        ("За 1 годину", 60),
-    )
-    return {"inline_keyboard": [
-        [{"text": label,
-          "callback_data": f"lead:{subscription_id}:{minutes}"}]
-        for label, minutes in options
-    ]}
+def inline_choice_keyboard(subscription_id: int, selected=()):
+    """Four independent checkbox choices; none selected by default."""
+    chosen = set(selected)
+    if any(x not in (5, 15, 30, 60) for x in chosen):
+        raise ValueError("Невідомий часовий інтервал")
+    titles = ((5, "За 5 хвилин"), (15, "За 15 хвилин"),
+              (30, "За 30 хвилин"), (60, "За 1 годину"))
+    result = [
+        [{"text": ("☑ " if n in chosen else "☐ ") + title,
+          "callback_data": f"toggle:{subscription_id}:{n}"}]
+        for n, title in titles
+    ]
+    result.append([{"text": "💾 Зберегти вибір",
+                    "callback_data": f"save:{subscription_id}"}])
+    result.append([{"text": "🚫 Не нагадувати (за замовчуванням)",
+                    "callback_data": f"off:{subscription_id}"}])
+    return {"inline_keyboard": result}
+
+
+def parse_preference_action(data: str):
+    """Return action, subscription ID, optional minute; no target ID from caller."""
+    parts = data.split(":")
+    if len(parts) == 3 and parts[0] == "toggle":
+        action, subscription, minutes = parts
+        try:
+            sub_id, minute = int(subscription), int(minutes)
+        except ValueError:
+            raise ValueError("Некоректна кнопка") from None
+        if sub_id <= 0 or minute not in (5, 15, 30, 60):
+            raise ValueError("Некоректна кнопка")
+        return action, sub_id, minute
+    if len(parts) == 2 and parts[0] in ("save", "off"):
+        try:
+            sub_id = int(parts[1])
+        except ValueError:
+            raise ValueError("Некоректна кнопка") from None
+        if sub_id <= 0:
+            raise ValueError("Некоректна кнопка")
+        return parts[0], sub_id, None
+    if len(parts) == 3 and parts[0] == "lead":
+        sub_id, minute = parse_choice(data)
+        return "legacy", sub_id, minute
+    raise ValueError("Некоректна кнопка")
 
 
 def parse_choice(data: str):
