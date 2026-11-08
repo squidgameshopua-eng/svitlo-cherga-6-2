@@ -85,6 +85,12 @@ def connect(filename=":memory:") -> sqlite3.Connection:
             attempts INTEGER NOT NULL DEFAULT 0,
             UNIQUE(subscription_id, local_day, start_at, lead_minutes)
         );
+        CREATE TABLE IF NOT EXISTS dispatch_limits (
+            scope TEXT NOT NULL,
+            window_start INTEGER NOT NULL,
+            used INTEGER NOT NULL,
+            PRIMARY KEY(scope, window_start)
+        );
         CREATE INDEX IF NOT EXISTS reminders_pending
             ON reminders(status, due_at, retry_after);
         CREATE INDEX IF NOT EXISTS subs_by_location
@@ -463,7 +469,7 @@ def lease_due(db: sqlite3.Connection, now: datetime, batch: int = 20):
         """, (ts,))
         jobs = db.execute("""
             SELECT r.id,r.start_at,r.due_at,r.subscription_id,
-                   s.label,r.lead_minutes,d.chat_id
+                   s.label,r.lead_minutes,d.chat_id,d.chat_kind
             FROM reminders r
             JOIN subscriptions s ON s.id=r.subscription_id
             JOIN destinations d ON d.id=s.destination_id
@@ -484,6 +490,52 @@ def lease_due(db: sqlite3.Connection, now: datetime, batch: int = 20):
             """, (ts + 75, job["id"]))
         db.execute("COMMIT")
         return [dict(j) for j in jobs]
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def reserve_free_delivery_slot(
+    db: sqlite3.Connection, *, chat_id: str, chat_kind: str,
+    now: datetime, global_per_second: int = 25
+) -> bool:
+    """Shared transactional quota: below Telegram's free broadcast ceiling.
+
+    This single-worker SQLite implementation is NOT a distributed rate limiter.
+    Production replicas must use a shared atomic counter or centralized sender.
+    """
+    if global_per_second not in range(1, 26):
+        raise ValueError("Невірний безоплатний ліміт повідомлень")
+    ts = unix_utc(now)
+    quotas = [
+        ("global:sec", ts, global_per_second),
+        (f"chat:{chat_id}:sec", ts, 1),
+    ]
+    if chat_kind in ("group", "supergroup"):
+        quotas.append((f"chat:{chat_id}:minute", ts // 60, 18))
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for scope, slot, ceiling in quotas:
+            row = db.execute("""
+                SELECT used FROM dispatch_limits WHERE scope=? AND window_start=?
+            """, (scope, slot)).fetchone()
+            if row is not None and row["used"] >= ceiling:
+                db.execute("COMMIT")
+                return False
+        for scope, slot, _ceiling in quotas:
+            db.execute("""
+                INSERT INTO dispatch_limits(scope,window_start,used)
+                VALUES (?,?,1)
+                ON CONFLICT(scope,window_start)
+                DO UPDATE SET used=dispatch_limits.used+1
+            """, (scope, slot))
+        # Delete only buckets older than one hour; keep current windows.
+        db.execute("DELETE FROM dispatch_limits WHERE window_start<? AND scope LIKE '%:sec'",
+                   (ts - 3600,))
+        db.execute("DELETE FROM dispatch_limits WHERE window_start<? AND scope LIKE '%:minute'",
+                   (ts // 60 - 60,))
+        db.execute("COMMIT")
+        return True
     except Exception:
         db.execute("ROLLBACK")
         raise
