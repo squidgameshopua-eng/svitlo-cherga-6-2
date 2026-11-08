@@ -111,6 +111,8 @@ def register(
     """
     if chat_kind not in VALID_KINDS:
         raise ValueError("Невідомий тип Telegram-чату")
+    if not isinstance(label, str) or len(label) > 60:
+        raise ValueError("Назва адреси має бути до 60 символів")
     fields = (chat_id, actor_id, operator, oblast, settlement,
               street, building, queue_code, label)
     if any(not isinstance(x, str) or not x.strip() or len(x) > 160 for x in fields):
@@ -134,6 +136,16 @@ def register(
             SELECT id FROM locations WHERE operator=? AND oblast=?
                 AND settlement=? AND street=? AND building=?
         """, (operator, oblast, settlement, street, building)).fetchone()
+        prior = db.execute("""
+            SELECT id FROM subscriptions
+            WHERE destination_id=? AND location_id=? AND queue_code=?
+        """, (dest["id"], loc["id"], queue_code)).fetchone()
+        if prior is None:
+            count = db.execute("""
+                SELECT COUNT(*) FROM subscriptions WHERE destination_id=?
+            """, (dest["id"],)).fetchone()[0]
+            if count >= 30:
+                raise ValueError("Ліміт безплатної версії: 30 адресних підписок на чат")
         db.execute("""
             INSERT INTO subscriptions(destination_id,location_id,queue_code,label)
             VALUES (?,?,?,?)
