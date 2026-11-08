@@ -266,8 +266,11 @@ def address_message(event, changed=False):
         lines.append("Початок: " + html.escape(event["start"]))
     if event["end"]:
         lines.append("Орієнтовне завершення: " + html.escape(event["end"]))
-    if event["reason"]:
-        lines.append("Причина: " + html.escape(event["reason"][:170]))
+    # Keep the original address and free-form operational details private.
+    if event["category"] == "repair":
+        lines.append("Причина: планові роботи")
+    elif event["category"] == "fault":
+        lines.append("Причина: аварійне відключення")
     lines.append("Час відновлення може змінитися.")
     lines.append(f'<a href="{DTEK_SOURCE}">Джерело: ДТЕК</a>')
     return "\n".join(lines)
