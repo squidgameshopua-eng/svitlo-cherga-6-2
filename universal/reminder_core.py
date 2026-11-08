@@ -529,13 +529,24 @@ def reserve_free_delivery_slot(
                 ON CONFLICT(scope,window_start)
                 DO UPDATE SET used=dispatch_limits.used+1
             """, (scope, slot))
-        # Delete only buckets older than one hour; keep current windows.
-        db.execute("DELETE FROM dispatch_limits WHERE window_start<? AND scope LIKE '%:sec'",
-                   (ts - 3600,))
-        db.execute("DELETE FROM dispatch_limits WHERE window_start<? AND scope LIKE '%:minute'",
-                   (ts // 60 - 60,))
         db.execute("COMMIT")
         return True
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def prune_delivery_buckets(db: sqlite3.Connection, now: datetime):
+    """Run out of band (e.g. hourly), never on every delivered message."""
+    ts = unix_utc(now)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("""
+            DELETE FROM dispatch_limits
+            WHERE (scope LIKE '%:sec' AND window_start<?)
+               OR (scope LIKE '%:minute' AND window_start<?)
+        """, (ts - 3600, ts // 60 - 60))
+        db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK")
         raise
