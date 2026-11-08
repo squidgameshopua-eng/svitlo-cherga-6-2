@@ -274,6 +274,8 @@ def address_message(event, changed=False):
 
 
 def address_clear_message(old, now):
+    # Store only the end time publicly. Never persist the private reason
+    # or the original address response in bot_state.json.
     end = parse_dtek_date(old.get("end"))
     if end is None or now >= end:
         return None  # Normal disappearance after predicted end: no extra noise.
@@ -294,21 +296,30 @@ def address_decision(entry, state, now, expected="GPV6.2"):
     old = state.get(key)
     event = address_event(entry)
     if event:
+        # Ignore stale past incidents that no longer affect today's plans.
+        finish = parse_dtek_date(event["end"])
+        if finish and finish < now and not isinstance(old, dict):
+            event = None
+    if event:
         digest = hashlib.sha256(json.dumps(
             event, sort_keys=True, ensure_ascii=False
         ).encode("utf-8")).hexdigest()
         if not isinstance(old, dict) or old.get("digest") != digest:
             result.append(("address", key, {
-                "digest": digest, "event": event, "status": "active",
+                "digest": digest,
+                "end": event["end"],
+                "status": "active",
             }, address_message(event, changed=isinstance(old, dict) and
                                old.get("status") == "active")))
     elif isinstance(old, dict) and old.get("status") == "active":
-        msg = address_clear_message(old["event"], now)
+        msg = address_clear_message({"end": old.get("end", "")}, now)
         result.append(("address", key, {"status": "inactive"}, msg))
     # Group changes need human attention. Do not broadcast initial group assignment.
     previous = state.get("address:groups")
     current = sorted(set(entry.group_ids))
-    if previous is not None and previous != current:
+    if (previous is not None and previous != current) or (
+        previous is None and current and expected not in current
+    ):
         label = ", ".join(x.removeprefix("GPV") for x in current)
         text = (
             "⚠️ <b>ДТЕК змінив чергу за адресою</b>\n"
