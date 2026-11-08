@@ -7,6 +7,7 @@ getChatMember before calling confirm_address or callback_choice.
 from __future__ import annotations
 
 import json
+import html
 from datetime import datetime
 from typing import Callable
 
@@ -155,6 +156,50 @@ def callback_choice(
         "reply_markup": inline_choice_keyboard(sub_id, choices),
         "confirmation": confirmation,
     }
+
+
+def format_subscription_dashboard(subscriptions, max_chars=3500):
+    """Split one user's private settings dashboard into safe Telegram messages.
+
+    Caller must first authorize every subscription. Never use this renderer
+    to display private addresses inside a group or channel.
+    """
+    if max_chars < 300 or max_chars > 4096:
+        raise ValueError("Некоректна довжина повідомлення")
+    header = "📋 <b>Мої адреси та отримувачі</b>"
+    if not subscriptions:
+        return [header + "\n\nНемає підключених адрес."]
+    pages = []
+    current = header
+    for item in subscriptions:
+        kind = item["chat_kind"]
+        glyph = {"private": "👤", "group": "👥", "supergroup": "👥",
+                 "channel": "📢"}.get(kind, "📍")
+        dest = html.escape(item["chat_title"][:120])
+        label = html.escape(item["label"][:160])
+        status = "активна" if item["status"] == "active" else "призупинена"
+        leads = item.get("reminder_minutes", ())
+        title = f"{glyph} <b>{dest}</b> · №{item['subscription_id']}"
+        lines = [title, f"Назва: <b>{label}</b>",
+                 f"Черга: {html.escape(item['queue'])}",
+                 f"Стан: {status}"]
+        if "settlement" in item:
+            # Private dashboard only, never a public group reply.
+            lines.append("Адреса: " + html.escape(
+                f"{item['settlement']}, {item['street']}, {item['building']}"
+            ))
+        lines.append("Нагадування: " + (
+            ", ".join(f"за {x} хв" for x in sorted(leads, reverse=True))
+            if leads else "вимкнено"
+        ))
+        entry = "\n\n" + "\n".join(lines)
+        if len(current) + len(entry) > max_chars:
+            pages.append(current)
+            current = header + entry
+        else:
+            current += entry
+    pages.append(current)
+    return pages
 
 
 def send_due_batch(db, send_message, now: datetime, batch=20):
