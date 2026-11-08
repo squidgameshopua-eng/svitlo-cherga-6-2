@@ -72,7 +72,7 @@ def regional_event(post):
         return None
     if re.search(r"скасован|припинен|завершен|відмінено", title):
         status = "ended"
-    elif re.search(r"запроваджен|застосован|введен|діють|тривають|продовжен", title):
+    elif re.search(r"запроваджен|застосован|введен|діють|тривають|продовжен", title + " " + post["text"].casefold()):
         status = "active"
     else:
         # Ambiguous headlines must never generate residents' alerts.
@@ -119,6 +119,7 @@ def region_candidates(page, state, now):
     except (ValueError, TypeError):
         raise RuntimeError("Некоректний стан останнього офіційного повідомлення")
     pending = []
+    simulated = {}
     for post in posts:
         if post["id"] <= old_id:
             continue
@@ -129,15 +130,20 @@ def region_candidates(page, state, now):
             continue
         if now - post["date"] > timedelta(hours=6):
             continue
-        # Track the two regimes separately, ignoring repetitive "still active".
+        # Track transitions within a batch, not just the saved initial state.
         key = f"official:status:{event['kind']}"
-        previous = state.get(key, "unknown")
+        previous = simulated.get(key, state.get(key, "unknown"))
         if event["status"] == "active":
             if previous != "active":
                 pending.append((post["id"], key, "active", regional_message(event)))
+                simulated[key] = "active"
         elif previous == "active":
             pending.append((post["id"], key, "ended", regional_message(event)))
-    state["official:last_id"] = max(old_id, max_id)
+            simulated[key] = "ended"
+    # A final checkpoint never triggers an outgoing message.
+    # The caller saves it only after prior sends succeed.
+    pending.append((max(old_id, max_id), "official:last_id",
+                    max(old_id, max_id), None))
     return pending
 
 
@@ -311,5 +317,6 @@ def address_decision(entry, state, now, expected="GPV6.2"):
             f'<a href="{DTEK_SOURCE}">Джерело: ДТЕК</a>'
         )
         result.append(("address", "address:groups", current, text))
-    state["address:groups"] = current
+    if previous is None:
+        result.append(("address", "address:groups", current, None))
     return result
