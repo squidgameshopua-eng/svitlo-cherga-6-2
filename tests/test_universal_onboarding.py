@@ -91,7 +91,7 @@ def test_disabled_reminder_does_not_disable_schedule_news():
         is_admin_of_destination=lambda *_:False,now=NOW,
     )
     assert "нагадування вимкнено" in output["confirmation"].lower()
-    assert "Сповіщення про графік" in output["confirmation"]
+    assert "Повідомлення про графік" in output["confirmation"]
 
 
 def test_worker_only_marks_sent_after_success():
