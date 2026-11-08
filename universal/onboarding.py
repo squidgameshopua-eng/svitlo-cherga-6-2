@@ -15,6 +15,7 @@ from universal.reminder_core import (
     choose_lead, inline_choice_keyboard, lease_due, mark_failed,
     mark_sent, parse_preference_action, register, reminder_text,
     selected_leads, set_leads, subscription_for_chat, unix_utc,
+    reserve_free_delivery_slot,
 )
 
 
@@ -208,19 +209,46 @@ def format_subscription_dashboard(subscriptions, max_chars=3500):
 
 
 def send_due_batch(db, send_message, now: datetime, batch=20):
-    """Worker loop unit: send then mark delivered; failures remain retryable.
+    """No paid Telegram sending; aggregate labels and back off on free-rate limits.
 
-    send_message(chat_id, text) must raise on Telegram error or 429.
-    Run a dispatcher often enough, with per-chat and global rate limiting.
+    One verified due interval in one chat = at most one message, even if
+    multiple subscriptions point to matching outages. Failed deliveries retry.
+    For nationwide use a distributed rate limiter, not this SQLite prototype.
     """
+    jobs = lease_due(db, now, batch=batch)
+    buckets = {}
+    for job in jobs:
+        key = (job["chat_id"], job["due_at"], job["start_at"])
+        buckets.setdefault(key, []).append(job)
     delivered = 0
-    for job in lease_due(db, now, batch=batch):
-        try:
-            text = reminder_text(job, now)
-            send_message(job["chat_id"], text)
-        except Exception:
-            mark_failed(db, job["id"], now)
+    for (chat_id, _due_at, start_at), entries in buckets.items():
+        if not reserve_free_delivery_slot(
+            db, chat_id=chat_id, chat_kind=entries[0]["chat_kind"], now=now,
+        ):
+            for job in entries:
+                mark_failed(db, job["id"], now, retry_seconds=2)
+            continue
+        labels = tuple(dict.fromkeys(item["label"] for item in entries))
+        if len(labels) == 1:
+            text = reminder_text(entries[0], now)
         else:
-            mark_sent(db, job["id"])
+            lead = max(1, (start_at - unix_utc(now) + 59) // 60)
+            start_time = datetime.fromtimestamp(
+                start_at, tz=now.tzinfo
+            ).strftime("%H:%M")
+            text = (
+                "⏰ Нагадування про планове відключення\n"
+                f"Початок: {start_time} · приблизно за {lead} хв.\n"
+                "Адреси:\n" + "\n".join(f"• {label}" for label in labels) +
+                "\nЧас може змінитися. Перевіряйте оновлення графіка."
+            )
+        try:
+            send_message(chat_id, text)
+        except Exception:
+            for job in entries:
+                mark_failed(db, job["id"], now)
+        else:
+            for job in entries:
+                mark_sent(db, job["id"])
             delivered += 1
     return delivered
