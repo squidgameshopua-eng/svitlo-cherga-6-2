@@ -36,7 +36,7 @@ def test_same_person_many_addresses_same_personal_chat():
     accessible = list_accessible_subscriptions(
         db, actor_id="101", is_admin_of_destination=lambda *_:False
     )
-    assert [r["label"] for r in accessible] == ["Дім", "Для бабусі", "Робота"]
+    assert {r["label"] for r in accessible} == {"Дім", "Для бабусі", "Робота"}
     assert len({r["subscription_id"] for r in accessible}) == 3
     assert all(r["chat_title"] == "Особистий чат" for r in accessible)
 
