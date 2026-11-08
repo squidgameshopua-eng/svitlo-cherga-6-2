@@ -79,52 +79,157 @@ def clock(minutes):
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
-def message(day, group, confirmed, spans, unknown, updated, changed=False):
-    """A confirmed daily schedule with actual outages. Never announce missing data."""
-    if not confirmed or unknown or not spans:
+def minutes_text(minutes):
+    """Ukrainian duration; fractional hours stay precise to the minute."""
+    hours, mins = divmod(minutes, 60)
+    if hours and mins:
+        return f"{hours} год {mins} хв"
+    if hours:
+        return f"{hours} год"
+    return f"{mins} хв"
+
+
+def duration(spans, kind):
+    """Sum lengths without counting potential outages as confirmed."""
+    parts = sorted((a, b) for a, b, status in spans if status == kind)
+    total = 0
+    if not parts:
+        return 0
+    start, end = parts[0]
+    for a, b in parts[1:]:
+        if a <= end:
+            end = max(end, b)
+        else:
+            total += end - start
+            start, end = a, b
+    return total + end - start
+
+
+def day_message(day, group, spans, updated=None, event="new"):
+    """Ukrainian daily message, only when there are scheduled/possible outages."""
+    if not spans:
         return None
+    titles = {
+        "new": "⚡️ <b>Графік відключень</b>",
+        "changed": "🔄 <b>Графік відключень змінено</b>",
+        "resumed": "⚠️ <b>Відключення знову заплановано</b>",
+    }
     lines = [
-        "🔄 <b>Изменение суточного графика</b>" if changed else
-        "⚡️ <b>Суточный график</b>",
-        f"📆 {day:%d.%m.%Y} — Черга {html.escape(group.removeprefix('GPV'))}",
+        titles[event],
+        f"📅 {day:%d.%m.%Y} · Черга {html.escape(group.removeprefix('GPV'))}",
     ]
-    for mode, heading in (("off", "🔴 Плановые отключения:"),
-                          ("maybe", "🟠 Возможные отключения:")):
-        selected = [(a, b) for a, b, value in spans if value == mode]
+    for kind, title in (("off", "🔴 Заплановані відключення:"),
+                        ("maybe", "🟠 Можливі відключення:")):
+        selected = [(a, b) for a, b, status in spans if status == kind]
         if selected:
-            lines.extend(["", f"<b>{heading}</b>"])
+            lines.extend(["", f"<b>{title}</b>"])
             lines.extend(f"• {clock(a)}–{clock(b)}" for a, b in selected)
+    confirmed_minutes = duration(spans, "off")
+    possible_minutes = duration(spans, "maybe")
+    if confirmed_minutes:
+        lines.append(f"\n⏱ Загалом без світла за графіком: <b>{minutes_text(confirmed_minutes)}</b>")
+    if possible_minutes:
+        lines.append(f"⏱ Можливі відключення: <b>{minutes_text(possible_minutes)}</b>")
     if updated:
-        lines.append("\nОбновлено ДТЭК: " + html.escape(str(updated)))
-    lines.append(f'\n<a href="{SOURCE}">Источник: ДТЭК</a>')
+        lines.append("\nОновлено: " + html.escape(str(updated)))
+    lines.append(f'<a href="{SOURCE}">Джерело: ДТЕК</a>')
     return "\n".join(lines)
 
 
-def weekly_message(week_start, group, entries, changed=False):
-    """Clearly label separate seven-day forecast as tentative."""
+def cancellation_message(day, group, updated=None):
+    """Cancellation is a meaningful change only after a prior outage notice."""
+    lines = [
+        "✅ <b>Планові відключення скасовано</b>",
+        f"📅 {day:%d.%m.%Y} · Черга {html.escape(group.removeprefix('GPV'))}",
+        "",
+        "За оновленим графіком планових відключень немає.",
+    ]
+    if updated:
+        lines.append("\nОновлено: " + html.escape(str(updated)))
+    lines.append(f'<a href="{SOURCE}">Джерело: ДТЕК</a>')
+    return "\n".join(lines)
+
+
+def weekly_message(monday, group, entries, changed=False):
+    """Separate, clearly preliminary Ukrainian weekly forecast."""
     if not entries:
         return None
-    week_end = week_start + timedelta(days=6)
+    sunday = monday + timedelta(days=6)
     lines = [
-        "🔄 <b>Обновление недельного прогноза</b>" if changed else
-        "📅 <b>Недельный прогноз возможных отключений</b>",
-        f"Черга {html.escape(group.removeprefix('GPV'))} · "
-        f"{week_start:%d.%m}–{week_end:%d.%m.%Y}",
+        "🔄 <b>Тижневий прогноз змінено</b>" if changed else
+        "📆 <b>Тижневий прогноз можливих відключень</b>",
+        f"Черга {html.escape(group.removeprefix('GPV'))} · {monday:%d.%m}–{sunday:%d.%m.%Y}",
     ]
-    names = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+    weekdays = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд")
     for day, spans in entries:
-        lines.append(f"\n<b>{names[day.weekday()]} {day:%d.%m}</b>")
+        lines.append(f"\n<b>{weekdays[day.weekday()]} {day:%d.%m}</b>")
         lines.extend(f"• {clock(a)}–{clock(b)}" for a, b in spans)
-    lines.append("\n⚠️ Это только предварительный прогноз, не суточный график.")
-    lines.append(f'<a href="{SOURCE}">Источник: ДТЭК</a>')
+    lines.append("\n⚠️ Попередній прогноз. Точний графік на день публікується окремо.")
+    lines.append(f'<a href="{SOURCE}">Джерело: ДТЕК</a>')
     return "\n".join(lines)
 
 
-def collect_notifications(source, group, today):
-    """Create zero or more items to publish; never create no-data notices."""
+def weekly_cancellation_message(monday, group):
+    """Only for complete, explicit all-white weekly forecast after a prior notice."""
+    sunday = monday + timedelta(days=6)
+    return "\n".join([
+        "✅ <b>Тижневий прогноз відключень скасовано</b>",
+        f"Черга {html.escape(group.removeprefix('GPV'))} · {monday:%d.%m}–{sunday:%d.%m.%Y}",
+        "",
+        "У оновленій тижневій таблиці планових відключень немає.",
+        f'<a href="{SOURCE}">Джерело: ДТЕК</a>',
+    ])
+
+
+def state_digest(record):
+    """Read legacy SHA strings and the new structured state records."""
+    if isinstance(record, str):
+        return record
+    if isinstance(record, dict):
+        return record.get("digest")
+    return None
+
+
+def state_status(record):
+    """Historical SHA entries were only created for positive outage notices."""
+    if isinstance(record, str):
+        return "outages"
+    if isinstance(record, dict):
+        return record.get("status")
+    return None
+
+
+def fingerprint(payload):
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
+
+def parse_verified(slots, labels):
+    """Refuse incomplete/unknown tables, especially for all-clear decisions."""
+    if not isinstance(slots, dict) or not slots:
+        return None
+    if set(slots) != set(labels):
+        return None
+    try:
+        spans, unknown = intervals(slots, labels)
+    except (ValueError, RuntimeError):
+        return None
+    if unknown:
+        return None
+    return spans
+
+
+def collect_notifications(source, group, today, state=None):
+    """
+    Return notification candidates only for actual changes.
+
+    Missing/unreadable data are not equivalent to cancellation.
+    Complete all-white tables are cancellation evidence only if state
+    proves that a positive notice was sent previously.
+    """
+    state = state or {}
     labels = source.preset.time_zone if source.preset else None
     if not labels:
-        LOG.info("ДТЭК не предоставил временные интервалы; публикаций нет")
+        LOG.info("Немає часових інтервалів ДТЕК; публікацій немає")
         return []
 
     actual = {}
@@ -136,64 +241,54 @@ def collect_notifications(source, group, today):
                 continue
             actual[day] = group_map
             for slots in group_map.values():
-                if not slots:
-                    continue
-                try:
-                    spans, unknown = intervals(slots, labels)
-                except (ValueError, RuntimeError):
-                    continue
-                if not unknown and spans:
+                spans = parse_verified(slots, labels)
+                if spans:
                     active_region = True
 
-    out = []
+    result = []
     for day in (today, today + timedelta(days=1)):
-        slots = actual.get(day, {}).get(group)
-        if not slots:
-            continue
-        try:
-            spans, unknown = intervals(slots, labels)
-        except (ValueError, RuntimeError) as ex:
-            LOG.warning("Некорректный суточный график %s: %s", day, type(ex).__name__)
-            continue
-        # A table made entirely of white cells means no planned outage.
-        if unknown or not spans:
-            continue
         key = f"{day.isoformat()}:{group}"
-        payload = (day.isoformat(), group, True, spans, unknown)
-        out.append((key, payload, "day", (day, spans, source.fact.update)))
+        slots = actual.get(day, {}).get(group)
+        spans = parse_verified(slots, labels)
+        if spans is None:
+            continue
+        if spans:
+            # Maintain the legacy hash to avoid duplicate announcements
+            # when deploying the new state-aware bot.
+            payload = (day.isoformat(), group, True, spans, 0)
+            result.append((key, payload, "day", (day, spans, source.fact.update)))
+        elif state_status(state.get(key)) == "outages":
+            payload = (day.isoformat(), group, "cancelled")
+            result.append((key, payload, "day_cancel", (day, source.fact.update)))
 
-    # The preset table can exist even when no restrictions apply (e.g. in summer).
-    # Require a current regional daily outage before broadcasting a weekly forecast.
-    if active_region and source.preset.is_active:
-        monday = today - timedelta(days=today.weekday())
-        plan = source.preset.groups.get(group)
-        entries = []
-        valid = True
+    monday = today - timedelta(days=today.weekday())
+    week_key = f"week:{monday.isoformat()}:{group}"
+    plan = source.preset.groups.get(group) if source.preset.is_active else None
+    entries = []
+    all_seven_verified = bool(plan)
+    if plan:
         for weekday in range(1, 8):
-            dayplan = plan.get_day(weekday) if plan else None
-            if not dayplan or not dayplan.slots:
-                continue
-            try:
-                spans, unknown = intervals(dayplan.slots, labels)
-            except (ValueError, RuntimeError):
-                valid = False
+            item = plan.get_day(weekday)
+            spans = parse_verified(item.slots, labels) if item else None
+            if spans is None:
+                all_seven_verified = False
                 break
-            if unknown:
-                valid = False
-                break
-            possible = tuple((a, b) for a, b, mode in spans)
-            if possible:
-                entries.append((monday + timedelta(days=weekday - 1), possible))
-        if valid and entries:
-            payload = (monday.isoformat(), group,
-                       tuple((d.isoformat(), spans) for d, spans in entries))
-            out.append((f"week:{monday.isoformat()}:{group}", payload,
-                        "week", (monday, entries)))
-        elif not valid:
-            LOG.warning("Недельная таблица ДТЭК не распознана; публикаций нет")
-    else:
-        LOG.info("Недельный прогноз не объявляется: нет актуальных региональных отключений")
-    return out
+            if spans:
+                entries.append((
+                    monday + timedelta(days=weekday - 1),
+                    tuple((a, b) for a, b, _mode in spans),
+                ))
+
+    if all_seven_verified and entries and active_region:
+        # Maintain prior weekly hash for previously sent weekly forecasts.
+        payload = (monday.isoformat(), group,
+                   tuple((day.isoformat(), spans) for day, spans in entries))
+        result.append((week_key, payload, "week", (monday, entries)))
+    elif all_seven_verified and not entries and state_status(state.get(week_key)) == "outages":
+        payload = (monday.isoformat(), group, "cancelled")
+        result.append((week_key, payload, "week_cancel", (monday,)))
+
+    return result
 
 
 def state_read(path):
@@ -285,31 +380,46 @@ async def once():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat:
-        raise RuntimeError("Нужно указать TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в Secrets.")
+        raise RuntimeError("Відсутні секрети TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID")
     path = Path(os.getenv("STATE_PATH", "data/state.json"))
     state = state_read(path)
     source, groups = await get_schedule()
     today = datetime.now(KYIV).date()
-
+    sent = 0
     for group in groups:
-        for key, payload, kind, parts in collect_notifications(source, group, today):
-            digest = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
-            if state.get(key) == digest:
-                LOG.info("Нет изменений: %s", key)
+        for key, payload, kind, parts in collect_notifications(source, group, today, state):
+            digest = fingerprint(payload)
+            old = state.get(key)
+            if state_digest(old) == digest:
                 continue
-            changed = bool(state.get(key))
+            previous_status = state_status(old)
             if kind == "day":
                 day, spans, updated = parts
-                text = message(day, group, True, spans, 0, updated, changed=changed)
-            else:
+                event = ("resumed" if previous_status == "cancelled" else
+                         "changed" if previous_status == "outages" else "new")
+                text = day_message(day, group, spans, updated, event=event)
+            elif kind == "day_cancel":
+                day, updated = parts
+                text = cancellation_message(day, group, updated)
+            elif kind == "week":
                 monday, entries = parts
-                text = weekly_message(monday, group, entries, changed=changed)
+                text = weekly_message(monday, group, entries,
+                                      changed=previous_status == "outages")
+            elif kind == "week_cancel":
+                text = weekly_cancellation_message(parts[0], group)
+            else:
+                raise RuntimeError(f"Невідомий тип події: {kind}")
             if not text:
                 continue
             telegram_send(token, chat, text)
-            state[key] = digest
+            state[key] = {
+                "digest": digest,
+                "status": "cancelled" if kind.endswith("_cancel") else "outages",
+            }
             state_write(path, state)
-            LOG.info("Опубликован %s: %s", "обновлённый" if changed else "новый", key)
+            sent += 1
+            LOG.info("Надіслано повідомлення: %s (%s)", key, kind)
+    LOG.info("Нових сповіщень: %d", sent)
 
 
 def main():
