@@ -430,54 +430,105 @@ async def get_schedule():
 
 
 async def once():
+    """Check schedule and independent verified official announcements."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat:
         raise RuntimeError("Відсутні секрети TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID")
+
     path = Path(os.getenv("STATE_PATH", "data/state.json"))
     state = state_read(path)
-    source, groups = await get_schedule()
-    today = datetime.now(KYIV).date()
+    now = datetime.now(KYIV)
+    today = now.date()
     sent = 0
-    for group in groups:
-        for key, payload, kind, parts in collect_notifications(source, group, today, state):
-            digest = fingerprint(payload)
-            old = state.get(key)
-            if state_digest(old) == digest:
-                continue
-            previous_status = state_status(old)
-            if kind == "day":
-                day, spans, updated = parts
-                event = ("resumed" if previous_status == "cancelled" else
-                         "changed" if previous_status == "outages" else "new")
-                old_spans = None
-                if isinstance(old, dict) and isinstance(old.get("spans"), list):
-                    old_spans = [tuple(item) for item in old["spans"]]
-                text = day_message(day, group, spans, updated,
-                                   event=event, previous=old_spans)
-            elif kind == "day_cancel":
-                day, updated = parts
-                text = cancellation_message(day, group, updated)
-            elif kind == "week":
-                monday, entries = parts
-                text = weekly_message(monday, group, entries,
-                                      changed=previous_status == "outages")
-            elif kind == "week_cancel":
-                text = weekly_cancellation_message(parts[0], group)
-            else:
-                raise RuntimeError(f"Невідомий тип події: {kind}")
-            if not text:
-                continue
-            telegram_send(token, chat, text)
-            state[key] = {
-                "digest": digest,
-                "status": "cancelled" if kind.endswith("_cancel") else "outages",
-            }
-            if kind == "day":
-                state[key]["spans"] = [list(span) for span in parts[1]]
-            state_write(path, state)
-            sent += 1
-            LOG.info("Надіслано повідомлення: %s (%s)", key, kind)
+
+    # Schedule and official emergency notices are independent.
+    # Website failures must never be interpreted as outage cancellation.
+    try:
+        source, groups = await get_schedule()
+    except Exception as exc:
+        LOG.error("Графік ДТЕК недоступний: %s", type(exc).__name__)
+        source, groups = None, []
+
+    if source:
+        for group in groups:
+            for key, payload, kind, parts in collect_notifications(source, group, today, state):
+                digest = fingerprint(payload)
+                old = state.get(key)
+                if state_digest(old) == digest:
+                    continue
+                previous_status = state_status(old)
+                if kind == "day":
+                    day, spans, updated = parts
+                    event = ("resumed" if previous_status == "cancelled" else
+                             "changed" if previous_status == "outages" else "new")
+                    old_spans = None
+                    if isinstance(old, dict) and isinstance(old.get("spans"), list):
+                        old_spans = [tuple(item) for item in old["spans"]]
+                    text = day_message(day, group, spans, updated,
+                                       event=event, previous=old_spans)
+                elif kind == "day_cancel":
+                    day, updated = parts
+                    text = cancellation_message(day, group, updated)
+                elif kind == "week":
+                    monday, entries = parts
+                    text = weekly_message(monday, group, entries,
+                                          changed=previous_status == "outages")
+                elif kind == "week_cancel":
+                    text = weekly_cancellation_message(parts[0], group)
+                else:
+                    raise RuntimeError(f"Невідомий тип події: {kind}")
+                if not text:
+                    continue
+                telegram_send(token, chat, text)
+                state[key] = {
+                    "digest": digest,
+                    "status": "cancelled" if kind.endswith("_cancel") else "outages",
+                }
+                if kind == "day":
+                    state[key]["spans"] = [list(span) for span in parts[1]]
+                state_write(path, state)
+                sent += 1
+                LOG.info("Надіслано повідомлення ГПВ: %s (%s)", key, kind)
+
+    # Regional DTEK Telegram announcements: conservative exact-area matching.
+    if os.getenv("ANNOUNCEMENTS_ENABLED", "true").lower() == "true":
+        try:
+            from alerts import fetch_official_page, region_candidates
+
+            events = region_candidates(fetch_official_page(), state, now)
+            for message_id, key, value, text in events:
+                if text:
+                    telegram_send(token, chat, text)
+                    sent += 1
+                    state["official:last_id"] = message_id
+                    LOG.info("Надіслано повідомлення про регіональний режим: %s", key)
+                state[key] = value
+                state_write(path, state)
+            if not events and "official:last_id" in state:
+                state_write(path, state)
+        except Exception as exc:
+            LOG.warning("Офіційні повідомлення недоступні: %s", type(exc).__name__)
+
+    # Address-specific repairs and local emergency details are opt-in only.
+    # The full address is held exclusively in encrypted GitHub Actions Secrets.
+    private_address = os.getenv("DTEK_ADDRESS_JSON", "").strip()
+    if private_address:
+        try:
+            from alerts import address_decision, fetch_address_status
+
+            entry = await fetch_address_status(private_address)
+            changes = address_decision(entry, state, now)
+            for _channel, key, value, text in changes:
+                if text:
+                    telegram_send(token, chat, text)
+                    sent += 1
+                    LOG.info("Надіслано адресне повідомлення: %s", key)
+                state[key] = value
+                state_write(path, state)
+        except Exception as exc:
+            LOG.warning("Адресна перевірка не виконана: %s", type(exc).__name__)
+
     LOG.info("Нових сповіщень: %d", sent)
 
 
