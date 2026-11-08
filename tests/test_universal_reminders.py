@@ -217,3 +217,20 @@ def test_pause_cancels_pending_reminders():
                              day=DAY, starts=[start], now=NOW)
     pause_subscription(db, sub, chat_id="100", authorized=True)
     assert lease_due(db, start-timedelta(minutes=5)) == []
+
+
+def test_concurrent_schedule_refresh_does_not_release_leased_reminder():
+    db = connect()
+    sub = register_one(db)
+    choose_lead(db, subscription_id=sub, chat_id="100",
+                actor_is_authorized=True, minutes=5, now=NOW)
+    start = NOW + timedelta(hours=1)
+    publish_confirmed_starts(db, location_id=1, queue_code="6.2",
+                             day=DAY, starts=[start], now=NOW)
+    due = start - timedelta(minutes=5)
+    first = lease_due(db, due)
+    assert len(first) == 1
+    publish_confirmed_starts(db, location_id=1, queue_code="6.2",
+                             day=DAY, starts=[start], now=due)
+    assert lease_due(db, due + timedelta(seconds=10)) == []
+    assert len(lease_due(db, due + timedelta(seconds=76))) == 1
