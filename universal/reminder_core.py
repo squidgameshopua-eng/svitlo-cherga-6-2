@@ -162,7 +162,7 @@ def list_accessible_subscriptions(
     db: sqlite3.Connection, *, actor_id: str,
     is_admin_of_destination,
     manageable_chat_ids: tuple[str, ...] = (),
-    include_address: bool = True
+    include_address: bool = False
 ):
     """Query ONLY chats supplied by the authenticated Telegram session.
 
