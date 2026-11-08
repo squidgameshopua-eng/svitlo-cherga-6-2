@@ -225,3 +225,16 @@ def test_group_mismatch_at_first_verified_read_gets_warning():
     state={}
     result=address_decision(house(groups=["GPV5.1"]),state,NOW)
     assert any(x[1]=="address:groups" and x[3] for x in result)
+
+
+def test_reason_wording_only_does_not_alert_again():
+    state={}
+    a=house(reason="Планові роботи",kind="1",
+            start="08.11.2026 17:00",end="08.11.2026 20:00")
+    b=house(reason="Планові роботи з технічного обслуговування",kind="1",
+            start="08.11.2026 17:00",end="08.11.2026 20:00")
+    first=address_decision(a,state,NOW)
+    for _,key,value,_ in first:
+        state[key]=value
+    follow=address_decision(b,state,NOW)
+    assert not [item for item in follow if item[3]]
