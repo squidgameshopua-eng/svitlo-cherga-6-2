@@ -161,22 +161,29 @@ def update_chat_title(
 def list_accessible_subscriptions(
     db: sqlite3.Connection, *, actor_id: str,
     is_admin_of_destination,
+    manageable_chat_ids: tuple[str, ...] = (),
     include_address: bool = True
 ):
-    """Return only recipients this Telegram user may actually manage.
+    """Query ONLY chats supplied by the authenticated Telegram session.
 
-    Admin rights must be verified using Telegram getChatMember at request time.
-    Do not show other users' subscriptions in /my_addresses.
+    Group/channel permissions must be rechecked with getChatMember.
+    This query scales with the user's chats, not every chat in Ukraine.
     """
-    rows = db.execute("""
+    # This is a lookup hint, not proof of authorization.
+    chat_ids = tuple(dict.fromkeys((actor_id, *manageable_chat_ids)))
+    if len(chat_ids) > 100:
+        raise ValueError("Забагато чатів для однієї перевірки")
+    placeholders = ",".join("?" for _ in chat_ids)
+    rows = db.execute(f"""
         SELECT s.id AS subscription_id, s.label, s.queue_code, s.status,
                s.lead_minutes, d.chat_id, d.chat_kind, d.chat_title,
                d.owner_user_id, l.settlement, l.street, l.building
-        FROM subscriptions s
-        JOIN destinations d ON d.id=s.destination_id
+        FROM destinations d
+        JOIN subscriptions s ON s.destination_id=d.id
         JOIN locations l ON l.id=s.location_id
+        WHERE d.chat_id IN ({placeholders})
         ORDER BY d.chat_kind, d.chat_title, s.label, s.id
-    """).fetchall()
+    """, chat_ids).fetchall()
     allowed = []
     for row in rows:
         if row["chat_kind"] == "private":
