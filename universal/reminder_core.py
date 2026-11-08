@@ -31,7 +31,8 @@ def connect(filename=":memory:") -> sqlite3.Connection:
             id INTEGER PRIMARY KEY,
             chat_id TEXT NOT NULL UNIQUE,
             chat_kind TEXT NOT NULL,
-            owner_user_id TEXT NOT NULL
+            owner_user_id TEXT NOT NULL,
+            chat_title TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS locations (
             id INTEGER PRIMARY KEY,
@@ -139,6 +140,134 @@ def register(
         """, (dest["id"], loc["id"], queue_code)).fetchone()
         db.execute("COMMIT")
         return int(sub["id"])
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def update_chat_title(
+    db: sqlite3.Connection, *, chat_id: str,
+    title: str, actor_is_authorized: bool
+) -> None:
+    """Keep chat title for human-friendly dashboards, not as a chat identifier."""
+    if not actor_is_authorized:
+        raise PermissionError("Недостатньо прав")
+    if not isinstance(title, str) or len(title) > 120:
+        raise ValueError("Некоректна назва чату")
+    db.execute("UPDATE destinations SET chat_title=? WHERE chat_id=?",
+               (title.strip(), chat_id))
+
+
+def list_accessible_subscriptions(
+    db: sqlite3.Connection, *, actor_id: str,
+    is_admin_of_destination,
+    include_address: bool = True
+):
+    """Return only recipients this Telegram user may actually manage.
+
+    Admin rights must be verified using Telegram getChatMember at request time.
+    Do not show other users' subscriptions in /my_addresses.
+    """
+    rows = db.execute("""
+        SELECT s.id AS subscription_id, s.label, s.queue_code, s.status,
+               s.lead_minutes, d.chat_id, d.chat_kind, d.chat_title,
+               d.owner_user_id, l.settlement, l.street, l.building
+        FROM subscriptions s
+        JOIN destinations d ON d.id=s.destination_id
+        JOIN locations l ON l.id=s.location_id
+        ORDER BY d.chat_kind, d.chat_title, s.label, s.id
+    """).fetchall()
+    allowed = []
+    for row in rows:
+        if row["chat_kind"] == "private":
+            visible = row["owner_user_id"] == actor_id and row["chat_id"] == actor_id
+        else:
+            visible = bool(is_admin_of_destination(row["chat_id"], actor_id))
+        if not visible:
+            continue
+        chat_caption = ("Особистий чат" if row["chat_kind"] == "private"
+                        else row["chat_title"] or "Група або канал")
+        result = {
+            "subscription_id": row["subscription_id"],
+            "destination_id": row["chat_id"],
+            "chat_kind": row["chat_kind"],
+            "chat_title": chat_caption,
+            "label": row["label"],
+            "queue": row["queue_code"],
+            "status": row["status"],
+            "reminder_minutes": selected_leads(db, row["subscription_id"]),
+        }
+        if include_address:
+            result.update({
+                "settlement": row["settlement"],
+                "street": row["street"],
+                "building": row["building"],
+            })
+        allowed.append(result)
+    return allowed
+
+
+def delete_subscription(
+    db: sqlite3.Connection, *, subscription_id: int,
+    chat_id: str, actor_is_authorized: bool
+):
+    """Delete address+queue membership and its private notification history."""
+    if not actor_is_authorized:
+        raise PermissionError("Адресу може видалити лише власник або адміністратор")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        sub = subscription_for_chat(db, subscription_id, chat_id)
+        if sub is None:
+            raise PermissionError("Підписка не належить цьому чату")
+        location_id, destination_id = sub["location_id"], sub["destination_id"]
+        db.execute("DELETE FROM reminders WHERE subscription_id=?", (subscription_id,))
+        db.execute("DELETE FROM reminder_drafts WHERE subscription_id=?", (subscription_id,))
+        db.execute("DELETE FROM reminder_leads WHERE subscription_id=?", (subscription_id,))
+        db.execute("DELETE FROM subscriptions WHERE id=?", (subscription_id,))
+        remain = db.execute(
+            "SELECT 1 FROM subscriptions WHERE location_id=? LIMIT 1",
+            (location_id,)
+        ).fetchone()
+        if not remain:
+            db.execute("DELETE FROM confirmed_starts WHERE location_id=?", (location_id,))
+            db.execute("DELETE FROM locations WHERE id=?", (location_id,))
+        remain = db.execute(
+            "SELECT 1 FROM subscriptions WHERE destination_id=? LIMIT 1",
+            (destination_id,)
+        ).fetchone()
+        if not remain:
+            db.execute("DELETE FROM destinations WHERE id=?", (destination_id,))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def migrate_chat_id(
+    db: sqlite3.Connection, *, old_id: str, new_id: str,
+    verified_migration: bool
+):
+    """Handle Telegram group→supergroup migration without losing preferences."""
+    if not verified_migration:
+        raise PermissionError("Потрібна перевірена подія Telegram")
+    if not old_id or not new_id or old_id == new_id:
+        raise ValueError("Неправильна міграція")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        record = db.execute("SELECT id FROM destinations WHERE chat_id=?",
+                            (old_id,)).fetchone()
+        if record is None:
+            db.execute("COMMIT")
+            return False
+        if db.execute("SELECT id FROM destinations WHERE chat_id=?",
+                      (new_id,)).fetchone():
+            raise RuntimeError("Новий чат уже має окремі підписки")
+        db.execute("""
+            UPDATE destinations SET chat_id=?,chat_kind='supergroup'
+            WHERE id=?
+        """, (new_id, record["id"]))
+        db.execute("COMMIT")
+        return True
     except Exception:
         db.execute("ROLLBACK")
         raise
