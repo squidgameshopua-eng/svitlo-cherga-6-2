@@ -28,9 +28,14 @@ def test_first_address_wizard_shows_five_buttons():
     assert prompt["chat_id"]=="123"
     assert "Адресу збережено" in prompt["text"]
     assert len(prompt["reply_markup"]["inline_keyboard"])==6
-    assert [x[0]["callback_data"].split(":")[-1]
+    assert [x[0]["callback_data"]
             for x in prompt["reply_markup"]["inline_keyboard"]]==[
-        "0","5","15","30","60",
+        f"toggle:{prompt['subscription_id']}:5",
+        f"toggle:{prompt['subscription_id']}:15",
+        f"toggle:{prompt['subscription_id']}:30",
+        f"toggle:{prompt['subscription_id']}:60",
+        f"save:{prompt['subscription_id']}",
+        f"off:{prompt['subscription_id']}",
     ]
     result=callback_choice(
         db,callback_data=f"lead:{prompt['subscription_id']}:5",
