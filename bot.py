@@ -105,7 +105,56 @@ def duration(spans, kind):
     return total + end - start
 
 
-def day_message(day, group, spans, updated=None, event="new"):
+def subtract_spans(before, after):
+    """Return merged portions of intervals in before but not in after."""
+    result = []
+    for a, b in sorted(before):
+        remaining = [(a, b)]
+        for c, d in sorted(after):
+            next_parts = []
+            for start, end in remaining:
+                if d <= start or c >= end:
+                    next_parts.append((start, end))
+                else:
+                    if start < c:
+                        next_parts.append((start, c))
+                    if d < end:
+                        next_parts.append((d, end))
+            remaining = next_parts
+        result.extend(remaining)
+    merged = []
+    for a, b in sorted(result):
+        if merged and merged[-1][1] == a:
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def describe_changes(previous, current):
+    """Explain removed and added time ranges when prior intervals are available."""
+    if previous is None:
+        return []
+    lines = []
+    names = (
+        ("off", "✅ Прибрано із запланованих:", "❗ Додано заплановані:"),
+        ("maybe", "🟢 Прибрано із можливих:", "🟠 Додано можливі:"),
+    )
+    for kind, removed_title, added_title in names:
+        old = [(a, b) for a, b, status in previous if status == kind]
+        new = [(a, b) for a, b, status in current if status == kind]
+        removed = subtract_spans(old, new)
+        added = subtract_spans(new, old)
+        if removed:
+            lines.append(removed_title)
+            lines.extend(f"• {clock(a)}–{clock(b)}" for a, b in removed)
+        if added:
+            lines.append(added_title)
+            lines.extend(f"• {clock(a)}–{clock(b)}" for a, b in added)
+    return lines
+
+
+def day_message(day, group, spans, updated=None, event="new", previous=None):
     """Ukrainian daily message, only when there are scheduled/possible outages."""
     if not spans:
         return None
@@ -118,6 +167,10 @@ def day_message(day, group, spans, updated=None, event="new"):
         titles[event],
         f"📅 {day:%d.%m.%Y} · Черга {html.escape(group.removeprefix('GPV'))}",
     ]
+    if event == "changed":
+        details = describe_changes(previous, spans)
+        if details:
+            lines.extend(["", "<b>Що змінилося:</b>", *details])
     for kind, title in (("off", "🔴 Заплановані відключення:"),
                         ("maybe", "🟠 Можливі відключення:")):
         selected = [(a, b) for a, b, status in spans if status == kind]
@@ -397,7 +450,11 @@ async def once():
                 day, spans, updated = parts
                 event = ("resumed" if previous_status == "cancelled" else
                          "changed" if previous_status == "outages" else "new")
-                text = day_message(day, group, spans, updated, event=event)
+                old_spans = None
+                if isinstance(old, dict) and isinstance(old.get("spans"), list):
+                    old_spans = [tuple(item) for item in old["spans"]]
+                text = day_message(day, group, spans, updated,
+                                   event=event, previous=old_spans)
             elif kind == "day_cancel":
                 day, updated = parts
                 text = cancellation_message(day, group, updated)
@@ -416,6 +473,8 @@ async def once():
                 "digest": digest,
                 "status": "cancelled" if kind.endswith("_cancel") else "outages",
             }
+            if kind == "day":
+                state[key]["spans"] = [list(span) for span in parts[1]]
             state_write(path, state)
             sent += 1
             LOG.info("Надіслано повідомлення: %s (%s)", key, kind)
