@@ -570,7 +570,7 @@ def reminder_text(job, now: datetime) -> str:
     start = datetime.fromtimestamp(job["start_at"], KYIV).strftime("%H:%M")
     return (
         "⏰ Нагадування про планове відключення\n"
-        f"📍 {job['label']}\n"
+        f"📍 {job['label']} · №{job['subscription_id']}\n"
         f"Початок: {start}\n"
         f"До відключення приблизно {until} хв.\n"
         "Час може змінитися. Перевіряйте нові повідомлення про графік."
