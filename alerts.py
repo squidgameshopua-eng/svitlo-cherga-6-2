@@ -304,8 +304,11 @@ def address_decision(entry, state, now, expected="GPV6.2"):
         if finish and finish < now and not isinstance(old, dict):
             event = None
     if event:
+        # Text edits to a reason are not new events. Only category or time
+        # changes should trigger another notification for the entire building.
+        fingerprint = {k: event[k] for k in ("category", "start", "end")}
         digest = hashlib.sha256(json.dumps(
-            event, sort_keys=True, ensure_ascii=False
+            fingerprint, sort_keys=True, ensure_ascii=False
         ).encode("utf-8")).hexdigest()
         if not isinstance(old, dict) or old.get("digest") != digest:
             result.append(("address", key, {
