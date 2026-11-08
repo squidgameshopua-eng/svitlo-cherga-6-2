@@ -236,3 +236,23 @@ def test_no_personal_address_in_bot_source():
     source = (Path(__file__).resolve().parents[1] / "bot.py").read_text(encoding="utf-8")
     assert "DTEK_GROUP" in source
     assert "get_home_num(" not in source
+
+
+def test_partial_cancellation_and_added_interval_explained():
+    previous = [(0, 60, "off"), (120, 180, "off")]
+    current = [(0, 30, "off"), (180, 240, "off")]
+    text = day_message(TODAY, GROUP, current, event="changed", previous=previous)
+    assert "Що змінилося" in text
+    assert "Прибрано із запланованих" in text
+    assert "00:30–01:00" in text
+    assert "02:00–03:00" in text
+    assert "Додано заплановані" in text
+    assert "03:00–04:00" in text
+    assert "Загалом без світла за графіком" in text
+
+
+def test_unchanged_intervals_have_no_fake_differences():
+    spans = [(0, 60, "off")]
+    text = day_message(TODAY, GROUP, spans, event="changed", previous=spans)
+    assert "Прибрано із запланованих" not in text
+    assert "Додано заплановані" not in text
