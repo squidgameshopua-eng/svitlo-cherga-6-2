@@ -7,7 +7,9 @@ import pytest
 from universal.reminder_core import (
     choose_lead, connect, inline_choice_keyboard, lease_due, mark_failed,
     mark_sent, parse_choice, pause_subscription, publish_confirmed_starts,
-    register, reminder_text,
+    register, reminder_text, selected_leads, set_leads,
+    list_accessible_subscriptions, update_chat_title, delete_subscription,
+    migrate_chat_id,
 )
 
 K = ZoneInfo("Europe/Kyiv")
@@ -28,15 +30,19 @@ def test_first_address_setup_prompt_and_user_choice():
     sub = register_one(db)
     assert db.execute(
         "SELECT lead_minutes FROM subscriptions WHERE id=?", (sub,)
-    ).fetchone()[0] is None
+    ).fetchone()[0] == 0
     kb = inline_choice_keyboard(sub)["inline_keyboard"]
     assert [item[0]["text"] for item in kb] == [
-        "Не нагадувати", "За 5 хвилин", "За 15 хвилин",
-        "За 30 хвилин", "За 1 годину",
+        "☐ За 5 хвилин", "☐ За 15 хвилин",
+        "☐ За 30 хвилин", "☐ За 1 годину",
+        "💾 Зберегти вибір", "🚫 Не нагадувати (за замовчуванням)",
     ]
-    assert [parse_choice(i[0]["callback_data"]) for i in kb] == [
-        (sub, 0), (sub, 5), (sub, 15), (sub, 30), (sub, 60),
+    assert [i[0]["callback_data"] for i in kb] == [
+        f"toggle:{sub}:5", f"toggle:{sub}:15",
+        f"toggle:{sub}:30", f"toggle:{sub}:60",
+        f"save:{sub}", f"off:{sub}",
     ]
+    assert selected_leads(db, sub) == ()
 
 
 def test_not_remind_disables_only_reminders_and_survives_restart(tmp_path):
