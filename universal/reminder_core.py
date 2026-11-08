@@ -48,9 +48,14 @@ def connect(filename=":memory:") -> sqlite3.Connection:
             location_id INTEGER NOT NULL REFERENCES locations(id),
             queue_code TEXT NOT NULL,
             label TEXT NOT NULL,
-            lead_minutes INTEGER,
+            lead_minutes INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'active',
             UNIQUE(destination_id, location_id, queue_code)
+        );
+        CREATE TABLE IF NOT EXISTS reminder_leads (
+            subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+            minutes INTEGER NOT NULL CHECK(minutes IN (5,15,30,60)),
+            PRIMARY KEY(subscription_id, minutes)
         );
         CREATE TABLE IF NOT EXISTS confirmed_starts (
             location_id INTEGER NOT NULL REFERENCES locations(id),
@@ -65,11 +70,12 @@ def connect(filename=":memory:") -> sqlite3.Connection:
             local_day TEXT NOT NULL,
             start_at INTEGER NOT NULL,
             due_at INTEGER NOT NULL,
+            lead_minutes INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
             lease_until INTEGER,
             retry_after INTEGER,
             attempts INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(subscription_id, local_day, start_at)
+            UNIQUE(subscription_id, local_day, start_at, lead_minutes)
         );
         CREATE INDEX IF NOT EXISTS reminders_pending
             ON reminders(status, due_at, retry_after);
@@ -139,16 +145,23 @@ def subscription_for_chat(db, subscription_id: int, chat_id: str):
     """, (subscription_id, chat_id)).fetchone()
 
 
-def choose_lead(
-    db: sqlite3.Connection, *, subscription_id: int,
-    chat_id: str, actor_is_authorized: bool, minutes: int,
+def selected_leads(db: sqlite3.Connection, subscription_id: int) -> tuple[int, ...]:
+    return tuple(int(r[0]) for r in db.execute("""
+        SELECT minutes FROM reminder_leads
+        WHERE subscription_id=? ORDER BY minutes DESC
+    """, (subscription_id,)).fetchall())
+
+
+def set_leads(
+    db: sqlite3.Connection, *, subscription_id: int, chat_id: str,
+    actor_is_authorized: bool, minutes: tuple[int, ...] | list[int],
     now: datetime
 ) -> None:
-    """Apply an inline-button choice only after external authorization.
-
-    Rebuild queued reminders from persisted confirmed daily starts.
-    """
-    if minutes not in VALID_LEADS:
+    """Save optional checkbox choices, empty = OFF, and rebuild pending jobs."""
+    if not isinstance(minutes, (tuple, list)):
+        raise ValueError("Список нагадувань має бути списком")
+    selected = tuple(sorted(set(minutes), reverse=True))
+    if any(type(n) is not int or n not in VALID_LEADS or n == 0 for n in selected):
         raise ValueError("Час нагадування не підтримується")
     if not actor_is_authorized:
         raise PermissionError("Налаштування може змінювати лише адміністратор")
@@ -158,26 +171,44 @@ def choose_lead(
         sub = subscription_for_chat(db, subscription_id, chat_id)
         if sub is None:
             raise PermissionError("Підписка не належить цьому чату")
-        db.execute(
-            "UPDATE subscriptions SET lead_minutes=? WHERE id=?",
-            (minutes, subscription_id),
-        )
+        # lead_minutes is a compatibility summary; reminder_leads is canonical.
+        db.execute("UPDATE subscriptions SET lead_minutes=? WHERE id=?",
+                   (max(selected) if selected else 0, subscription_id))
+        db.execute("DELETE FROM reminder_leads WHERE subscription_id=?",
+                   (subscription_id,))
+        db.executemany("""
+            INSERT INTO reminder_leads(subscription_id, minutes) VALUES (?,?)
+        """, [(subscription_id, n) for n in selected])
         db.execute("""
             UPDATE reminders SET status='cancelled',lease_until=NULL
             WHERE subscription_id=? AND status IN ('pending','leased')
         """, (subscription_id,))
-        if minutes and sub["status"] == "active":
+        if selected and sub["status"] == "active":
             starts = db.execute("""
                 SELECT local_day,start_at FROM confirmed_starts
                 WHERE location_id=? AND queue_code=? AND start_at>?
             """, (sub["location_id"], sub["queue_code"], now_ts)).fetchall()
             for item in starts:
-                _upsert_job(db, subscription_id, item["local_day"],
-                            item["start_at"], minutes)
+                for minutes_before in selected:
+                    _upsert_job(db, subscription_id, item["local_day"],
+                                item["start_at"], minutes_before)
         db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK")
         raise
+
+
+def choose_lead(
+    db: sqlite3.Connection, *, subscription_id: int,
+    chat_id: str, actor_is_authorized: bool, minutes: int,
+    now: datetime
+) -> None:
+    """Backward-compatible choice of one reminder or none."""
+    if type(minutes) is not int or minutes not in VALID_LEADS:
+        raise ValueError("Час нагадування не підтримується")
+    set_leads(db, subscription_id=subscription_id, chat_id=chat_id,
+              actor_is_authorized=actor_is_authorized,
+              minutes=() if minutes == 0 else (minutes,), now=now)
 
 
 def pause_subscription(db, subscription_id: int, chat_id: str, authorized: bool):
@@ -203,20 +234,14 @@ def pause_subscription(db, subscription_id: int, chat_id: str, authorized: bool)
 def _upsert_job(db, sub_id, local_day, start_at, minutes):
     due = start_at - 60 * minutes
     db.execute("""
-        INSERT INTO reminders(subscription_id,local_day,start_at,due_at,status)
-        VALUES (?,?,?,?,'pending')
-        ON CONFLICT(subscription_id,local_day,start_at)
+        INSERT INTO reminders(subscription_id,local_day,start_at,due_at,lead_minutes,status)
+        VALUES (?,?,?,?,?,'pending')
+        ON CONFLICT(subscription_id,local_day,start_at,lead_minutes)
         DO UPDATE SET due_at=excluded.due_at,
-                      status=CASE WHEN reminders.status IN ('sent','leased')
-                                      THEN reminders.status
+                      status=CASE WHEN reminders.status='sent' THEN 'sent'
                                   ELSE 'pending' END,
-                      lease_until=CASE WHEN reminders.status='leased'
-                                           THEN reminders.lease_until
-                                       ELSE NULL END,
-                      retry_after=CASE WHEN reminders.status='leased'
-                                           THEN reminders.retry_after
-                                       ELSE NULL END
-    """, (sub_id, local_day, start_at, due))
+                      lease_until=NULL,retry_after=NULL
+    """, (sub_id, local_day, start_at, due, minutes))
 
 
 def publish_confirmed_starts(
@@ -250,29 +275,31 @@ def publish_confirmed_starts(
                 VALUES (?,?,?,?)
             """, (location_id, queue_code, local_day, start))
         subscribers = db.execute("""
-            SELECT id,lead_minutes,status FROM subscriptions
+            SELECT id,status FROM subscriptions
             WHERE location_id=? AND queue_code=?
         """, (location_id, queue_code)).fetchall()
         for sub in subscribers:
+            leads = selected_leads(db, sub["id"])
             jobs = db.execute("""
-                SELECT id,start_at,status FROM reminders
+                SELECT id,start_at,lead_minutes,status FROM reminders
                 WHERE subscription_id=? AND local_day=?
             """, (sub["id"], local_day)).fetchall()
             for job in jobs:
                 if job["status"] in ("pending", "leased") and (
                     job["start_at"] not in new_starts
-                    or not sub["lead_minutes"]
+                    or job["lead_minutes"] not in leads
                     or sub["status"] != "active"
                 ):
                     db.execute("""
                         UPDATE reminders SET status='cancelled',lease_until=NULL
                         WHERE id=?
                     """, (job["id"],))
-            if sub["lead_minutes"] and sub["status"] == "active":
+            if leads and sub["status"] == "active":
                 for start in sorted(new_starts):
                     if start > now_ts:
-                        _upsert_job(db, sub["id"], local_day, start,
-                                    sub["lead_minutes"])
+                        for minutes_before in leads:
+                            _upsert_job(db, sub["id"], local_day, start,
+                                        minutes_before)
         db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK")
@@ -290,7 +317,7 @@ def lease_due(db: sqlite3.Connection, now: datetime, batch: int = 20):
         """, (ts,))
         jobs = db.execute("""
             SELECT r.id,r.start_at,r.due_at,r.subscription_id,
-                   s.label,s.lead_minutes,d.chat_id
+                   s.label,r.lead_minutes,d.chat_id
             FROM reminders r
             JOIN subscriptions s ON s.id=r.subscription_id
             JOIN destinations d ON d.id=s.destination_id
@@ -298,7 +325,10 @@ def lease_due(db: sqlite3.Connection, now: datetime, batch: int = 20):
                    OR (r.status='leased' AND r.lease_until<=?))
               AND (r.retry_after IS NULL OR r.retry_after<=?)
               AND r.due_at<=? AND r.start_at>?
-              AND s.status='active' AND s.lead_minutes>0
+              AND s.status='active' AND EXISTS (
+                SELECT 1 FROM reminder_leads p
+                WHERE p.subscription_id=s.id AND p.minutes=r.lead_minutes
+              )
             ORDER BY r.due_at,r.id LIMIT ?
         """, (ts, ts, ts, ts, batch)).fetchall()
         for job in jobs:
