@@ -1,6 +1,26 @@
 {
   "2026-11-07:GPV6.2": "221f420b7971b639d186ef9a93fbf3db16ca46f9297d963067fddd34cd5b6286",
   "2026-11-08:GPV6.2": "d4ccc45e8fd152a3d81c362d16049833d0a69e00b7e41047f227ade8645b70a7",
+  "2026-11-09:GPV6.2": {
+    "digest": "d4ce3142de0faf2dd6c8b2eb181b2281ac37622fee8c346d7394fc7907171a9e",
+    "spans": [
+      [
+        240,
+        480,
+        "off"
+      ],
+      [
+        870,
+        1290,
+        "off"
+      ]
+    ],
+    "status": "outages"
+  },
   "official:last_id": 4815,
-  "week:2026-11-02:GPV6.2": "a146ddd1e37034860be01da220ae28dc69ff1ea0761e805cabf3e16accddd0fb"
+  "week:2026-11-02:GPV6.2": "a146ddd1e37034860be01da220ae28dc69ff1ea0761e805cabf3e16accddd0fb",
+  "week:2026-11-09:GPV6.2": {
+    "digest": "cc8b70c8a768941851760662a299c4475ccd51110f3cabaf519b5986170453dc",
+    "status": "outages"
+  }
 }
