@@ -43,6 +43,27 @@
     ],
     "status": "outages"
   },
+  "2026-11-11:GPV6.2": {
+    "digest": "0f2286b0e85a28d9c801aa522427ccb0b1f1e4a0af66173c59a5193dfffa5d76",
+    "spans": [
+      [
+        0,
+        120,
+        "off"
+      ],
+      [
+        510,
+        960,
+        "off"
+      ],
+      [
+        1140,
+        1380,
+        "off"
+      ]
+    ],
+    "status": "outages"
+  },
   "official:last_id": 4824,
   "week:2026-11-02:GPV6.2": "a146ddd1e37034860be01da220ae28dc69ff1ea0761e805cabf3e16accddd0fb",
   "week:2026-11-09:GPV6.2": {
