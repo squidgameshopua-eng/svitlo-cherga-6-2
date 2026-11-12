@@ -77,59 +77,62 @@ def due_reminders(source, group: str, now: datetime, choices: tuple[int, ...],
     return sorted(emitted, key=lambda x: x[2])
 
 
-def queue_hold(state: dict, *, verified_groups: list[str] | tuple[str, ...],
-               selected_group: str, approval: str = "",
-               new_code: str | None = None) -> tuple[bool, str | None]:
-    """Pause ALL alerts when the operator no longer verifies selected queue.
+def verified_house_queues(raw) -> tuple[str, ...]:
+    """Accept only explicit, recognized DTEK queue identifiers.
 
-    A single notification contains a one-time code. Owner must set
-    GitHub Action vars QUEUE_APPROVAL=<code> and DTEK_GROUP=<new queue>.
-    No public home address is ever included in the message or state.
+    Empty/malformed data never imply an actual queue removal.
     """
-    actual = sorted(set(verified_groups))
-    old = state.get("house:queue_hold")
-    if old:
-        # A second, verified change during a hold requires a NEW acknowledgment.
-        if actual and actual != old.get("groups"):
-            old["groups"] = actual
-            old["code"] = new_code or secrets.token_hex(4)
-            old["notified"] = False
-            return True, queue_hold_message(old)
-        if (approval and approval == old.get("code")
-                and selected_group in actual):
-            state.pop("house:queue_hold", None)
-            return False, None
-        if not old.get("notified"):
-            return True, queue_hold_message(old)
-        return True, None
-
-    if selected_group in actual:
-        return False, None
-
-    # Empty or unverified queue assignment is NOT a reliable new queue.
-    if not actual:
-        return True, None
-
-    code = new_code or secrets.token_hex(4)
-    hold = {"code": code, "groups": actual, "notified": False}
-    state["house:queue_hold"] = hold
-    return True, queue_hold_message(hold)
+    if not isinstance(raw, (list, tuple, set)) or not raw:
+        raise ValueError("ДТЕК не підтвердив черги будинку")
+    if any(not isinstance(group, str) or
+           not re.fullmatch(r"GPV[1-6]\.[12]", group) for group in raw):
+        raise ValueError("ДТЕК повернув непідтверджену чергу")
+    return tuple(sorted(set(raw)))
 
 
-def queue_hold_message(hold: dict) -> str:
-    groups = ", ".join(html.escape(g.removeprefix("GPV"))
-                       for g in hold["groups"])
-    code = html.escape(hold["code"])
-    return "\n".join((
-        "⚠️ <b>Черга будинку змінилася</b>",
-        f"ДТЕК указує: {groups}.",
-        "Публікацію графіків і нагадувань призупинено.",
-        "Адміністратору: перевірте чергу будинку.",
-        "Щоб відновити повідомлення, змініть у GitHub змінну DTEK_GROUP",
-        "і підтвердьте перехід змінною QUEUE_APPROVAL:",
-        f"<code>{code}</code>",
-        "До підтвердження бот не публікуватиме графіки.",
+def house_queue_transition(state: dict, groups: tuple[str, ...],
+                           default_group: str) -> tuple[list[str], str | None]:
+    """Compare verified queue sets and construct one Ukrainian change notice.
+
+    Do NOT update state before successful sending. The caller persists
+    'house:groups' after delivery, so a failed notification is retried.
+    Old blocking house:queue_hold state is migrated on successful lookup.
+    """
+    current = verified_house_queues(groups)
+    previous = state.get("house:groups")
+    has_previous = isinstance(previous, list) and bool(previous)
+    if has_previous:
+        previous = verified_house_queues(previous)
+    else:
+        # The previous fixed queue was a monitoring preference, not proof of
+        # the actual electrical wiring of this building.
+        previous = verified_house_queues([default_group])
+
+    prior = set(previous)
+    live = set(current)
+    added = sorted(live - prior)
+    removed = sorted(prior - live)
+    if not added and not removed:
+        return list(current), None
+
+    title = ("🔄 <b>ДТЕК оновив черги будинку</b>" if has_previous
+             else "⚡️ <b>Уточнено черги будинку</b>")
+    lines = [title]
+    if added:
+        lines.append("➕ Додано: " + ", ".join(
+            html.escape(x.removeprefix("GPV")) for x in added))
+    if removed:
+        label = "Вилучено" if has_previous else "Раніше відстежували"
+        lines.append("➖ " + label + ": " + ", ".join(
+            html.escape(x.removeprefix("GPV")) for x in removed))
+    lines.extend((
+        "Актуальні черги: " + ", ".join(
+            html.escape(x.removeprefix("GPV")) for x in current),
+        "✅ Бот продовжує надсилати графіки всіх черг за цією адресою.",
+        "Відключення можуть відрізнятися для частин будинку.",
+        '<a href="https://www.dtek-dnem.com.ua/ua/shutdowns">Джерело: ДТЕК</a>',
     ))
+    return list(current), "\n".join(lines)
 
 
 def trim_state(state: dict, today) -> int:
