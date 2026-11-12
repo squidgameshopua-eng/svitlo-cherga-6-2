@@ -6,6 +6,8 @@ on:
       - house_reliability.py
       - alerts.py
       - requirements.txt
+      - .github/workflows/check.yml
+      - .github/dependabot.yml
       - tests/**
       - .github/workflows/tests.yml
   workflow_dispatch:
@@ -21,5 +23,5 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements.txt pytest
+      - run: pip install -r requirements.txt pytest PyYAML
       - run: python -m pytest -q tests/
