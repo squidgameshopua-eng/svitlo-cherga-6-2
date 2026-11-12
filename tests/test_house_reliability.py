@@ -7,7 +7,8 @@ import pytest
 
 from bot import parse_verified, telegram_send
 from house_reliability import (
-    parse_reminder_minutes, due_reminders, queue_hold, trim_state,
+    parse_reminder_minutes, due_reminders, house_queue_transition,
+    verified_house_queues, trim_state,
 )
 
 KYIV = ZoneInfo("Europe/Kyiv")
@@ -88,44 +89,72 @@ def test_tomorrow_midnight_reminder_can_be_due_today():
     assert "00:00" in items[0][1]
 
 
-def test_queue_mismatch_pauses_until_explicit_one_time_acknowledgment():
+def test_initial_single_verified_queue_is_silent():
     state = {}
-    paused, message = queue_hold(
-        state,verified_groups=["GPV5.1"],selected_group=GROUP,new_code="1234abcd")
-    assert paused and "1234abcd" in message
-    assert state["house:queue_hold"]["groups"] == ["GPV5.1"]
-    state["house:queue_hold"]["notified"] = True
-    paused, message = queue_hold(
-        state,verified_groups=["GPV5.1"],selected_group=GROUP)
-    assert paused and message is None
-    paused, message = queue_hold(
-        state,verified_groups=["GPV5.1"],selected_group="GPV5.1",
-        approval="")
-    assert paused and message is None
-    paused, message = queue_hold(
-        state,verified_groups=["GPV5.1"],selected_group="GPV5.1",
-        approval="1234abcd")
-    assert not paused and message is None
-    assert "house:queue_hold" not in state
+    queues, notice = house_queue_transition(state, ("GPV6.2",), GROUP)
+    assert queues == ["GPV6.2"]
+    assert notice is None
 
 
-def test_queue_cannot_resume_on_foreign_ack_or_missing_confirmation():
-    state={}
-    queue_hold(state,verified_groups=["GPV4.1"],selected_group=GROUP,new_code="code0001")
-    state["house:queue_hold"]["notified"]=True
-    assert queue_hold(state,verified_groups=["GPV4.1"],
-                      selected_group="GPV4.1",approval="code0002")[0]
-    assert queue_hold(state,verified_groups=["GPV4.1"],
-                      selected_group=GROUP,approval="code0001")[0]
-    assert queue_hold(state,verified_groups=[],selected_group=GROUP)[0]
+def test_one_verified_queue_is_replaced_automatically():
+    state = {"house:groups": ["GPV6.2"]}
+    queues, notice = house_queue_transition(state, ("GPV5.1",), GROUP)
+    assert queues == ["GPV5.1"]
+    assert "Додано: 5.1" in notice
+    assert "Вилучено: 6.2" in notice
+    assert "продовжує" in notice
+    assert "Кропивницького" not in notice
+    # State must not advance before successful Telegram delivery.
+    assert state["house:groups"] == ["GPV6.2"]
+    state["house:groups"] = queues
+    _, repeated = house_queue_transition(state, ("GPV5.1",), GROUP)
+    assert repeated is None
 
 
-def test_never_send_home_address_in_queue_change_alert():
-    state={}
-    _,text = queue_hold(state,verified_groups=["GPV5.1"],selected_group=GROUP,new_code="abc12345")
-    assert "Умовна_вулиця" not in text
-    assert "12/Г" not in text
-    assert "5.1" in text
+def test_new_queue_added_to_house_without_disabling_old_queue():
+    state = {"house:groups": ["GPV6.2"]}
+    groups, msg = house_queue_transition(state, ("GPV6.2", "GPV5.1"), GROUP)
+    assert groups == ["GPV5.1", "GPV6.2"]
+    assert "Додано: 5.1" in msg
+    assert "Вилучено" not in msg
+    assert "Актуальні черги: 5.1, 6.2" in msg
+
+
+def test_old_queue_removed_but_remaining_queue_stays_active():
+    state = {"house:groups": ["GPV5.1", "GPV6.2"]}
+    groups, msg = house_queue_transition(state, ("GPV5.1",), GROUP)
+    assert groups == ["GPV5.1"]
+    assert "Вилучено: 6.2" in msg
+    assert "Додано:" not in msg
+
+
+def test_initial_address_lookup_differs_from_previous_monitored_queue():
+    groups, msg = house_queue_transition({}, ("GPV4.1", "GPV4.2"), GROUP)
+    assert groups == ["GPV4.1", "GPV4.2"]
+    assert "Раніше відстежували: 6.2" in msg
+    assert "Додано: 4.1, 4.2" in msg
+    assert "призупинено" not in msg
+
+
+def test_invalid_ambiguous_and_missing_groups_are_not_deletions():
+    import pytest
+    for value in ([], None, (), ["GPV6.2", "garbage"], ["4.1"]):
+        with pytest.raises(ValueError):
+            verified_house_queues(value)
+    assert verified_house_queues(["GPV6.2", "GPV5.1", "GPV6.2"]) == (
+        "GPV5.1", "GPV6.2"
+    )
+
+
+def test_legacy_queue_hold_not_used_for_auto_tracking():
+    state = {"house:queue_hold": {
+        "code": "secret", "groups": ["GPV5.1"], "notified": True
+    }}
+    groups, msg = house_queue_transition(state, ("GPV5.1",), GROUP)
+    assert groups == ["GPV5.1"]
+    assert "продовжує" in msg
+    assert "secret" not in msg
+
 
 
 def test_old_state_pruned_without_touching_current_events():
@@ -171,19 +200,3 @@ def test_reminder_never_sent_after_deadline(monkeypatch):
         telegram_send("private-token","-123","Тест",deadline=on(0,0))
     post.assert_not_called()
 
-
-def test_second_queue_reassignment_creates_one_new_notice():
-    state={}
-    queue_hold(state,verified_groups=["GPV5.1"],selected_group=GROUP,new_code="first111")
-    state["house:queue_hold"]["notified"]=True
-    paused, note=queue_hold(
-        state,verified_groups=["GPV4.2"],selected_group=GROUP,new_code="second22")
-    assert paused and "second22" in note
-    assert state["house:queue_hold"]["code"]=="second22"
-    state["house:queue_hold"]["notified"]=True
-    assert queue_hold(state,verified_groups=["GPV4.2"],selected_group=GROUP)==(True,None)
-    assert queue_hold(
-        state,verified_groups=["GPV4.2"],selected_group="GPV4.2",approval="first111")[0]
-    assert queue_hold(
-        state,verified_groups=["GPV4.2"],selected_group="GPV4.2",approval="second22")==(
-        False,None)
