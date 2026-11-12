@@ -14,10 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          persist-credentials: true
-      - uses: actions/setup-python@v5
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
           cache: pip
@@ -40,6 +40,8 @@ jobs:
         run: python bot.py --once
       - name: Save notification state even if later notifications fail
         if: always() && steps.notify.outcome != 'skipped'
+        env:
+          GITHUB_STATE_PUSH_TOKEN: ${{ github.token }}
         run: |
           if [[ -f bot_state.json ]]; then
             git config user.name "github-actions[bot]"
@@ -47,6 +49,17 @@ jobs:
             git add -f bot_state.json
             if ! git diff --cached --quiet; then
               git commit -m "Store notification state [skip ci]"
-              git push
+              # Do not persist the write-capable GitHub token in checkout.
+              # Only the state-saving step receives this token.
+              cat > "$RUNNER_TEMP/svitlo-askpass" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s' 'x-access-token' ;;
+            *Password*) printf '%s' "$GITHUB_STATE_PUSH_TOKEN" ;;
+          esac
+          ASKPASS
+              chmod 700 "$RUNNER_TEMP/svitlo-askpass"
+              GIT_ASKPASS="$RUNNER_TEMP/svitlo-askpass" GIT_TERMINAL_PROMPT=0 \
+                git push "https://github.com/$GITHUB_REPOSITORY.git" HEAD:main
             fi
           fi
