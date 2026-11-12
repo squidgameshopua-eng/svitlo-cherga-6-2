@@ -170,3 +170,20 @@ def test_reminder_never_sent_after_deadline(monkeypatch):
     with pytest.raises(RuntimeError,match="минув"):
         telegram_send("private-token","-123","Тест",deadline=on(0,0))
     post.assert_not_called()
+
+
+def test_second_queue_reassignment_creates_one_new_notice():
+    state={}
+    queue_hold(state,verified_groups=["GPV5.1"],selected_group=GROUP,new_code="first111")
+    state["house:queue_hold"]["notified"]=True
+    paused, note=queue_hold(
+        state,verified_groups=["GPV4.2"],selected_group=GROUP,new_code="second22")
+    assert paused and "second22" in note
+    assert state["house:queue_hold"]["code"]=="second22"
+    state["house:queue_hold"]["notified"]=True
+    assert queue_hold(state,verified_groups=["GPV4.2"],selected_group=GROUP)==(True,None)
+    assert queue_hold(
+        state,verified_groups=["GPV4.2"],selected_group="GPV4.2",approval="first111")[0]
+    assert queue_hold(
+        state,verified_groups=["GPV4.2"],selected_group="GPV4.2",approval="second22")==(
+        False,None)
