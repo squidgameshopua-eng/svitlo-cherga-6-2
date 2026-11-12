@@ -71,33 +71,161 @@ def test_unchanged_data_is_silent_across_restarts(tmp_path,monkeypatch):
     assert len(calls)==1
 
 
-def test_changed_queue_pauses_all_notifications_until_explicit_ack(tmp_path,monkeypatch):
+def address_entry(groups):
+    return SimpleNamespace(
+        group_ids=groups, outage_type="", start_date=None,
+        end_date=None, sub_type=None,
+    )
+
+
+def setup_address(monkeypatch):
+    monkeypatch.setenv(
+        "DTEK_ADDRESS_JSON",
+        '{"city":"місто","street":"вулиця","house":"12"}',
+    )
+    import alerts
+    current = {"queues": ["GPV6.2"]}
+
+    async def lookup(_secret):
+        return address_entry(current["queues"])
+
+    monkeypatch.setattr(alerts, "fetch_address_status", lookup)
+    return current
+
+
+def test_added_queue_produces_notice_and_both_schedules(tmp_path, monkeypatch):
+    state_file = tmp_path / "state.json"
+    setup(monkeypatch, state_file)
+    current = setup_address(monkeypatch)
+    current["queues"] = ["GPV6.2", "GPV5.1"]
+    requested = []
+
+    async def load(group_ids):
+        requested.append(tuple(group_ids))
+        today = datetime.now(KYIV).date()
+        stamp = str(int(datetime(today.year, today.month, today.day, tzinfo=KYIV).timestamp()))
+        source = SimpleNamespace(
+            preset=SimpleNamespace(time_zone={"1":"00-12","2":"12-24"},
+                                   is_active=False, groups={}),
+            fact=SimpleNamespace(
+                days={stamp: {
+                    "GPV6.2": {"1":"no", "2":"yes"},
+                    "GPV5.1": {"1":"yes", "2":"no"},
+                }},
+                update="12.11.2026 21:00"
+            ),
+        )
+        return source, list(group_ids)
+
+    monkeypatch.setattr(bot, "get_schedule", load)
+    calls=[]
+    monkeypatch.setattr(
+        bot, "telegram_send",
+        lambda _t, _c, text, deadline=None: calls.append(text),
+    )
+
+    asyncio.run(bot.once())
+    assert requested == [("GPV5.1", "GPV6.2")]
+    assert len(calls) == 3
+    assert sum("ДТЕК оновив черги" in m or "Уточнено черги" in m for m in calls) == 1
+    assert any("Черга 5.1" in m and "Графік відключень" in m for m in calls)
+    assert any("Черга 6.2" in m and "Графік відключень" in m for m in calls)
+    stored = json.loads(state_file.read_text(encoding="utf-8"))
+    assert stored["house:groups"] == ["GPV5.1","GPV6.2"]
+    assert not stored.get("house:queue_hold")
+
+    asyncio.run(bot.once())
+    assert len(calls) == 3
+
+
+def test_removed_queue_keeps_remaining_schedule_and_one_notice(tmp_path, monkeypatch):
+    state_file = tmp_path / "state.json"
+    setup(monkeypatch, state_file)
+    current = setup_address(monkeypatch)
+    current["queues"] = ["GPV5.1"]
+    state_file.write_text(json.dumps({
+        "house:groups": ["GPV5.1", "GPV6.2"],
+        "2026-01-01:GPV6.2": {"status":"outages","digest":"old"},
+    }), encoding="utf-8")
+
+    async def load(group_ids):
+        return fake_schedule(group="GPV5.1", days=1)
+    monkeypatch.setattr(bot, "get_schedule", load)
+    calls=[]
+    monkeypatch.setattr(
+        bot, "telegram_send",
+        lambda _t,_c,text,deadline=None: calls.append(text)
+    )
+    asyncio.run(bot.once())
+    assert len(calls) == 2
+    assert "Вилучено: 6.2" in calls[0]
+    assert any("Черга 5.1" in m for m in calls)
+    asyncio.run(bot.once())
+    assert len(calls) == 2
+
+
+def test_missing_address_data_never_sends_false_queue_change(tmp_path, monkeypatch):
+    state_file=tmp_path/"state.json"
+    setup(monkeypatch, state_file)
+    current=setup_address(monkeypatch)
+    current["queues"]=[]
+    calls=[]
+    monkeypatch.setattr(
+        bot,"telegram_send",
+        lambda _t,_c,text,deadline=None: calls.append(text)
+    )
+    async def should_not_run(*args):
+        raise AssertionError("No queue schedule should be sent without confirmation")
+    monkeypatch.setattr(bot,"get_schedule",should_not_run)
+    asyncio.run(bot.once())
+    assert calls == []
+    assert "house:groups" not in json.loads(state_file.read_text())
+
+
+def test_failed_queue_notice_retries_but_schedules_continue(tmp_path,monkeypatch):
     state_file=tmp_path/"state.json"
     setup(monkeypatch,state_file)
-    monkeypatch.setenv("DTEK_ADDRESS_JSON",'{"city":"місто","street":"вулиця","house":"12"}')
-    import alerts
-    async def address():
-        return SimpleNamespace(group_ids=["GPV5.1"],outage_type="",
-                               start_date=None,end_date=None,sub_type=None)
-    monkeypatch.setattr(alerts,"fetch_address_status",lambda secret:address())
-    async def should_not_call():
-        raise AssertionError("Must not read or send stale group during queue hold")
-    monkeypatch.setattr(bot,"get_schedule",should_not_call)
+    current=setup_address(monkeypatch)
+    current["queues"]=["GPV5.1"]
+    calls=[]
+    async def load(groups):
+        return fake_schedule(group="GPV5.1",days=1)
+    monkeypatch.setattr(bot,"get_schedule",load)
+
+    def send(_t,_c,text,deadline=None):
+        calls.append(text)
+        if "Уточнено черги" in text:
+            raise RuntimeError("Telegram unavailable for queue-change notice")
+    monkeypatch.setattr(bot,"telegram_send",send)
+    with pytest.raises(RuntimeError,match="Помилки Telegram"):
+        asyncio.run(bot.once())
+    assert any("Графік відключень" in x for x in calls)
+    assert not json.loads(state_file.read_text()).get("house:groups")
+    # The schedule was delivered once; the one-time queue notice is retried.
+    monkeypatch.setattr(bot,"telegram_send",
+                        lambda _t,_c,text,deadline=None: calls.append(text))
+    asyncio.run(bot.once())
+    assert sum("Уточнено черги" in x for x in calls) == 2
+    assert sum("Графік відключень" in x for x in calls) == 1
+
+
+def test_migrating_old_queue_hold_does_not_pause_anymore(tmp_path,monkeypatch):
+    state_file=tmp_path/"state.json"
+    setup(monkeypatch,state_file)
+    current=setup_address(monkeypatch)
+    current["queues"]=["GPV5.1","GPV6.2"]
+    state_file.write_text(json.dumps({
+        "house:queue_hold": {
+            "groups":["GPV5.1"], "notified":True,"code":"old-code"
+        }
+    }),encoding="utf-8")
+    async def load(groups):
+        return fake_schedule(group="GPV6.2",days=1)
+    monkeypatch.setattr(bot,"get_schedule",load)
     calls=[]
     monkeypatch.setattr(bot,"telegram_send",
-                        lambda _token,_chat,text,deadline=None:calls.append(text))
+                        lambda _t,_c,text,deadline=None:calls.append(text))
     asyncio.run(bot.once())
-    assert len(calls)==1
-    assert "Черга будинку змінилася" in calls[0]
-    stored=json.loads(state_file.read_text())
-    assert stored["house:queue_hold"]["notified"] is True
-    asyncio.run(bot.once())
-    assert len(calls)==1
-    monkeypatch.setenv("DTEK_GROUP","5.1")
-    monkeypatch.setenv("QUEUE_APPROVAL",stored["house:queue_hold"]["code"])
-    async def new_schedule():return fake_schedule("GPV5.1",days=1)
-    monkeypatch.setattr(bot,"get_schedule",new_schedule)
-    asyncio.run(bot.once())
-    assert len(calls)==2
-    assert "Черга 5.1" in calls[1]
     assert "house:queue_hold" not in json.loads(state_file.read_text())
+    assert any("5.1" in m and "Додано" in m for m in calls)
+    assert any("Графік відключень" in m for m in calls)
