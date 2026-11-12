@@ -357,18 +357,44 @@ def state_write(path, data):
     temp.replace(path)
 
 
-def telegram_send(token, chat, text):
-    try:
-        result = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": chat, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": "true"},
-            timeout=25,
-        )
-    except requests.RequestException:
-        raise RuntimeError("Ошибка подключения к Telegram; токен не записан в журнал.") from None
-    if result.status_code != 200 or not result.json().get("ok"):
-        raise RuntimeError(f"Telegram отклонил сообщение: HTTP {result.status_code}")
+def telegram_send(token, chat, text, deadline=None):
+    """Respect Telegram 429 RetryAfter; never send after reminder deadline.
+
+    Telegram sendMessage has no idempotency key. A network timeout after
+    delivery can cause a duplicate on retry; we do not claim exactly once.
+    """
+    for attempt in range(3):
+        if deadline is not None and datetime.now(KYIV) >= deadline:
+            raise RuntimeError("Термін нагадування минув; застаріле повідомлення не надсилається")
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={"chat_id": chat, "text": text, "parse_mode": "HTML",
+                      "disable_web_page_preview": "true"},
+                timeout=20,
+            )
+        except requests.RequestException:
+            raise RuntimeError("Немає зв'язку з Telegram; доставка невідома") from None
+        try:
+            body = response.json()
+        except ValueError:
+            raise RuntimeError(f"Некоректна відповідь Telegram HTTP {response.status_code}") from None
+        if response.status_code == 200 and body.get("ok") is True:
+            return body.get("result", {}).get("message_id")
+        if response.status_code == 429:
+            delay = (body.get("parameters") or {}).get("retry_after", 1)
+            try:
+                delay = max(1, int(delay))
+            except (TypeError, ValueError):
+                delay = 1
+            if attempt < 2 and delay <= 12 and (
+                deadline is None or datetime.now(KYIV) + timedelta(seconds=delay + 1) < deadline
+            ):
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Telegram обмежив швидкість, повтор через {delay} с")
+        raise RuntimeError(f"Telegram відхилив повідомлення: HTTP {response.status_code}")
+    raise RuntimeError("Telegram: кількість повторів вичерпано")
 
 
 async def get_schedule():
@@ -430,20 +456,99 @@ async def get_schedule():
 
 
 async def once():
-    """Check schedule and independent verified official announcements."""
+    """One-house notification run: urgent changes first, reminders only while timely."""
+    from house_reliability import (
+        due_reminders, parse_reminder_minutes, queue_hold, trim_state,
+    )
+
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat:
-        raise RuntimeError("Відсутні секрети TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID")
+        raise RuntimeError("Відсутні TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID")
 
     path = Path(os.getenv("STATE_PATH", "data/state.json"))
     state = state_read(path)
     now = datetime.now(KYIV)
     today = now.date()
+    selected = os.getenv("DTEK_GROUP", "6.2").strip()
+    group_id = "GPV" + selected
+    leads = parse_reminder_minutes(os.getenv("REMINDER_MINUTES", "0"))
+    trim_state(state, today)
+    state_write(path, state)
+    problems = []
     sent = 0
 
-    # Schedule and official emergency notices are independent.
-    # Website failures must never be interpreted as outage cancellation.
+    # A house is distinct from a generic regional queue. If an address secret
+    # is provided, verify its operator assignment BEFORE any regional messages.
+    house = None
+    private_address = os.getenv("DTEK_ADDRESS_JSON", "").strip()
+    if private_address:
+        try:
+            from alerts import fetch_address_status
+            house = await fetch_address_status(private_address)
+            if not house or not house.group_ids:
+                LOG.warning("Адресна черга не підтверджена, повідомлення призупинено")
+                return
+            paused, notice = queue_hold(
+                state, verified_groups=house.group_ids,
+                selected_group=group_id,
+                approval=os.getenv("QUEUE_APPROVAL", "").strip(),
+            )
+            state_write(path, state)
+            if notice:
+                try:
+                    telegram_send(token, chat, notice)
+                except Exception as ex:
+                    LOG.error("Не вдалося попередити про зміну черги: %s",
+                              type(ex).__name__)
+                    raise
+                state["house:queue_hold"]["notified"] = True
+                state_write(path, state)
+            if paused:
+                LOG.info("Чергу будинку змінено; очікується підтвердження адміністратора")
+                return
+        except Exception as exc:
+            LOG.error("Адресну перевірку не виконано: %s", type(exc).__name__)
+            # Never publish a possibly wrong queue while address verification fails.
+            return
+    elif state.get("house:queue_hold"):
+        LOG.warning("Чергу не підтверджено; адресний секрет відсутній")
+        return
+
+    pending = []
+    seq = 0
+
+    def enqueue(priority, key, value, message, origin, deadline=None, cursor=None):
+        nonlocal seq
+        pending.append((priority, seq, key, value, message, origin, deadline, cursor))
+        seq += 1
+
+    # Official emergency and GAV announcements are prioritized.
+    if os.getenv("ANNOUNCEMENTS_ENABLED", "true").lower() == "true":
+        try:
+            from alerts import fetch_official_page, region_candidates
+            events = region_candidates(fetch_official_page(), state, now)
+            for post_id, key, value, message in events:
+                enqueue(0, key, value, message, "official", cursor=post_id)
+            if not events and "official:last_id" in state:
+                state_write(path, state)
+        except Exception as exc:
+            LOG.warning("Офіційні оголошення недоступні: %s", type(exc).__name__)
+
+    if house is not None:
+        try:
+            from alerts import address_decision
+            for _channel, key, value, message in address_decision(
+                    house, state, now, expected=group_id):
+                if key == "address:groups":
+                    # Queue change is handled by the blocking confirmation guard.
+                    state[key] = value
+                    state_write(path, state)
+                    continue
+                enqueue(1, key, value, message, "address")
+        except Exception as exc:
+            LOG.warning("Адресні події недоступні: %s", type(exc).__name__)
+
     try:
         source, groups = await get_schedule()
     except Exception as exc:
@@ -458,6 +563,10 @@ async def once():
                 if state_digest(old) == digest:
                     continue
                 previous_status = state_status(old)
+                next_state = {
+                    "digest": digest,
+                    "status": "cancelled" if kind.endswith("_cancel") else "outages",
+                }
                 if kind == "day":
                     day, spans, updated = parts
                     event = ("resumed" if previous_status == "cancelled" else
@@ -465,71 +574,78 @@ async def once():
                     old_spans = None
                     if isinstance(old, dict) and isinstance(old.get("spans"), list):
                         old_spans = [tuple(item) for item in old["spans"]]
-                    text = day_message(day, group, spans, updated,
-                                       event=event, previous=old_spans)
+                    message = day_message(day, group, spans, updated,
+                                          event=event, previous=old_spans)
+                    next_state["spans"] = [list(span) for span in spans]
+                    priority = 2 if event == "changed" else 4
                 elif kind == "day_cancel":
                     day, updated = parts
-                    text = cancellation_message(day, group, updated)
+                    message = cancellation_message(day, group, updated)
+                    priority = 2
                 elif kind == "week":
                     monday, entries = parts
-                    text = weekly_message(monday, group, entries,
-                                          changed=previous_status == "outages")
+                    message = weekly_message(monday, group, entries,
+                                             changed=previous_status == "outages")
+                    priority = 7
                 elif kind == "week_cancel":
-                    text = weekly_cancellation_message(parts[0], group)
+                    message = weekly_cancellation_message(parts[0], group)
+                    priority = 3
                 else:
-                    raise RuntimeError(f"Невідомий тип події: {kind}")
-                if not text:
+                    LOG.warning("Невідомий тип графіка: %s", kind)
                     continue
-                telegram_send(token, chat, text)
-                state[key] = {
-                    "digest": digest,
-                    "status": "cancelled" if kind.endswith("_cancel") else "outages",
-                }
-                if kind == "day":
-                    state[key]["spans"] = [list(span) for span in parts[1]]
-                state_write(path, state)
-                sent += 1
-                LOG.info("Надіслано повідомлення ГПВ: %s (%s)", key, kind)
+                if message:
+                    enqueue(priority, key, next_state, message, "schedule")
 
-    # Regional DTEK Telegram announcements: conservative exact-area matching.
-    if os.getenv("ANNOUNCEMENTS_ENABLED", "true").lower() == "true":
+            # Exact lead-time reminders are independent of schedule-change notices.
+            for key, message, deadline in due_reminders(
+                    source, group, now, leads, state, parse_verified):
+                enqueue(5, key, {"sent": True}, message, "reminder", deadline)
+
+    # Preserve order among official announcements (e.g. start then cancel).
+    # A failed send must not advance the official feed checkpoint.
+    pending.sort(key=lambda item: (item[0], item[1]))
+    official_failed = False
+    last_send = 0.0
+    for _priority, _seq, key, value, message, origin, deadline, cursor in pending:
+        if origin == "official" and official_failed:
+            continue
+        if key == "official:last_id" and origin == "official":
+            state[key] = value
+            state_write(path, state)
+            continue
+        if not message:
+            state[key] = value
+            state_write(path, state)
+            continue
+        if deadline is not None and datetime.now(KYIV) >= deadline:
+            LOG.info("Пропущено прострочене нагадування: %s", key)
+            continue
+        # Limit to one outgoing Telegram message per second for this one chat.
+        delay = 1.05 - (time.monotonic() - last_send) if last_send else 0
+        if delay > 0:
+            time.sleep(delay)
+        if deadline is not None and datetime.now(KYIV) >= deadline:
+            LOG.info("Пропущено прострочене нагадування: %s", key)
+            continue
         try:
-            from alerts import fetch_official_page, region_candidates
-
-            events = region_candidates(fetch_official_page(), state, now)
-            for message_id, key, value, text in events:
-                if text:
-                    telegram_send(token, chat, text)
-                    sent += 1
-                    state["official:last_id"] = message_id
-                    LOG.info("Надіслано повідомлення про регіональний режим: %s", key)
-                state[key] = value
-                state_write(path, state)
-            if not events and "official:last_id" in state:
-                state_write(path, state)
+            telegram_send(token, chat, message, deadline=deadline)
         except Exception as exc:
-            LOG.warning("Офіційні повідомлення недоступні: %s", type(exc).__name__)
+            if origin == "official":
+                official_failed = True
+            LOG.error("Помилка доставки (%s): %s", origin, type(exc).__name__)
+            problems.append(origin)
+            continue
+        last_send = time.monotonic()
+        if origin == "official":
+            state["official:last_id"] = cursor
+        state[key] = value
+        state_write(path, state)
+        sent += 1
+        LOG.info("Надіслано: %s", key)
 
-    # Address-specific repairs and local emergency details are opt-in only.
-    # The full address is held exclusively in encrypted GitHub Actions Secrets.
-    private_address = os.getenv("DTEK_ADDRESS_JSON", "").strip()
-    if private_address:
-        try:
-            from alerts import address_decision, fetch_address_status
-
-            entry = await fetch_address_status(private_address)
-            changes = address_decision(entry, state, now)
-            for _channel, key, value, text in changes:
-                if text:
-                    telegram_send(token, chat, text)
-                    sent += 1
-                    LOG.info("Надіслано адресне повідомлення: %s", key)
-                state[key] = value
-                state_write(path, state)
-        except Exception as exc:
-            LOG.warning("Адресна перевірка не виконана: %s", type(exc).__name__)
-
-    LOG.info("Нових сповіщень: %d", sent)
+    LOG.info("Нових сповіщень: %d; помилок доставки: %d", sent, len(problems))
+    if problems:
+        raise RuntimeError(f"Помилки Telegram: {len(problems)}; успішні події збережено")
 
 
 def main():
