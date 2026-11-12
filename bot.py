@@ -598,7 +598,7 @@ async def once():
 
             # Exact lead-time reminders are independent of schedule-change notices.
             for key, message, deadline in due_reminders(
-                    source, group, now, leads, state, parse_verified):
+                    source, group, datetime.now(KYIV), leads, state, parse_verified):
                 enqueue(5, key, {"sent": True}, message, "reminder", deadline)
 
     # Preserve order among official announcements (e.g. start then cancel).
