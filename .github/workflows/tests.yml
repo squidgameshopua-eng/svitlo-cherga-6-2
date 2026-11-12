@@ -3,6 +3,8 @@ on:
   push:
     paths:
       - bot.py
+      - house_reliability.py
+      - alerts.py
       - requirements.txt
       - tests/**
       - .github/workflows/tests.yml
