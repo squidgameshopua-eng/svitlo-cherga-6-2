@@ -2,7 +2,7 @@ name: Check DTEK schedule
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/5 * * * *'
 permissions:
   contents: write
 concurrency:
@@ -26,17 +26,20 @@ jobs:
       - name: Install Chromium for DTEK WAF fallback
         run: python -m playwright install --with-deps chromium
       - name: Read DTEK and notify Telegram
+        id: notify
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DTEK_GROUP: ${{ vars.DTEK_GROUP || '6.2' }}
+          REMINDER_MINUTES: ${{ vars.REMINDER_MINUTES || '0' }}
+          QUEUE_APPROVAL: ${{ vars.QUEUE_APPROVAL || '' }}
           DTEK_WAF_BROWSER: "1"
           ANNOUNCEMENTS_ENABLED: ${{ vars.ANNOUNCEMENTS_ENABLED || 'true' }}
           DTEK_ADDRESS_JSON: ${{ secrets.DTEK_ADDRESS_JSON }}
           STATE_PATH: bot_state.json
         run: python bot.py --once
-      - name: Save notification state
-        if: success()
+      - name: Save notification state even if later notifications fail
+        if: always() && steps.notify.outcome != 'skipped'
         run: |
           if [[ -f bot_state.json ]]; then
             git config user.name "github-actions[bot]"
