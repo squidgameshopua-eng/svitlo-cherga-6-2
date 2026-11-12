@@ -397,16 +397,20 @@ def telegram_send(token, chat, text, deadline=None):
     raise RuntimeError("Telegram: кількість повторів вичерпано")
 
 
-async def get_schedule():
-    """Fetch a DTEK regional queue schedule without an address."""
+async def get_schedule(group_ids=None):
+    """Fetch the regional schedule once for all verified queues of one house."""
     from types import SimpleNamespace
     from dtek_client import DtekClient
     from dtek_client.models import FactSchedule, PresetSchedule
 
-    group = os.getenv("DTEK_GROUP", "6.2").strip()
-    if not re.fullmatch(r"[1-6]\.[12]", group):
-        raise RuntimeError("Некорректная очередь ДТЭК (пример: 6.2)")
-    group_id = "GPV" + group
+    from house_reliability import verified_house_queues
+    if group_ids is None:
+        group = os.getenv("DTEK_GROUP", "6.2").strip()
+        if not re.fullmatch(r"[1-6]\.[12]", group):
+            raise RuntimeError("Некоректна черга ДТЕК")
+        group_ids = ("GPV" + group,)
+    else:
+        group_ids = verified_house_queues(group_ids)
     api_url = "https://www.dtek-dnem.com.ua/ua/ajax"
 
     async def fetch(client):
@@ -421,12 +425,13 @@ async def get_schedule():
         fact = FactSchedule.model_validate(fact_raw) if isinstance(fact_raw, dict) else None
         if not preset.time_zone:
             raise RuntimeError("ДТЭК не вернул временные интервалы")
-        if group_id not in preset.groups and (
-            not fact or not any(group_id in m for m in fact.days.values())
-        ):
-            raise RuntimeError("Очередь ДТЭК не найдена в данных региона")
-        LOG.info("ДТЭК: Дніпровська область, черга %s", group)
-        return SimpleNamespace(preset=preset, fact=fact), [group_id]
+        missing = [group_id for group_id in group_ids
+                   if group_id not in preset.groups and
+                   (not fact or not any(group_id in m for m in fact.days.values()))]
+        if missing:
+            raise RuntimeError("Для підтверджених черг будинку немає регіональних графіків")
+        LOG.info("ДТЕК: Дніпропетровська область, черг у будинку: %d", len(group_ids))
+        return SimpleNamespace(preset=preset, fact=fact), list(group_ids)
 
     try:
         async with DtekClient("dnem", ajax_url=api_url) as client:
@@ -458,7 +463,8 @@ async def get_schedule():
 async def once():
     """One-house notification run: urgent changes first, reminders only while timely."""
     from house_reliability import (
-        due_reminders, parse_reminder_minutes, queue_hold, trim_state,
+        due_reminders, house_queue_transition, parse_reminder_minutes,
+        trim_state, verified_house_queues,
     )
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -478,42 +484,37 @@ async def once():
     problems = []
     sent = 0
 
-    # A house is distinct from a generic regional queue. If an address secret
-    # is provided, verify its operator assignment BEFORE any regional messages.
+    # A DTEK address may have multiple queues. Never infer assignments
+    # from the previously configured single DTEK_GROUP.
     house = None
+    house_groups = None
+    queue_change = None
     private_address = os.getenv("DTEK_ADDRESS_JSON", "").strip()
     if private_address:
         try:
             from alerts import fetch_address_status
             house = await fetch_address_status(private_address)
-            if not house or not house.group_ids:
-                LOG.warning("Адресна черга не підтверджена, повідомлення призупинено")
-                return
-            paused, notice = queue_hold(
-                state, verified_groups=house.group_ids,
-                selected_group=group_id,
-                approval=os.getenv("QUEUE_APPROVAL", "").strip(),
+            house_groups = verified_house_queues(
+                house.group_ids if house is not None else None
             )
-            state_write(path, state)
-            if notice:
-                try:
-                    telegram_send(token, chat, notice)
-                except Exception as ex:
-                    LOG.error("Не вдалося попередити про зміну черги: %s",
-                              type(ex).__name__)
-                    raise
-                state["house:queue_hold"]["notified"] = True
+            house_snapshot, queue_change = house_queue_transition(
+                state, house_groups, group_id
+            )
+            # The old approval/hold mechanism is obsolete. The current
+            # confirmed queues govern automatic tracking after migration.
+            if "house:queue_hold" in state:
+                state.pop("house:queue_hold", None)
                 state_write(path, state)
-            if paused:
-                LOG.info("Чергу будинку змінено; очікується підтвердження адміністратора")
-                return
         except Exception as exc:
-            LOG.error("Адресну перевірку не виконано: %s", type(exc).__name__)
-            # Never publish a possibly wrong queue while address verification fails.
+            LOG.warning("Не вдалося перевірити черги за адресою: %s",
+                        type(exc).__name__)
+            # Missing or ambiguous address data are not a queue change.
+            # Refuse to publish a potentially incorrect fixed queue.
             return
     elif state.get("house:queue_hold"):
-        LOG.warning("Чергу не підтверджено; адресний секрет відсутній")
+        LOG.warning("Раніше чергу не підтверджено; потрібен секрет адреси")
         return
+
 
     pending = []
     seq = 0
@@ -522,6 +523,15 @@ async def once():
         nonlocal seq
         pending.append((priority, seq, key, value, message, origin, deadline, cursor))
         seq += 1
+
+    # Announce queue additions/removals exactly once; never pause the house.
+    # A failed announcement leaves the old snapshot for the next check.
+    if house_groups is not None:
+        if queue_change:
+            enqueue(1, "house:groups", house_snapshot, queue_change, "queue_change")
+        elif state.get("house:groups") != house_snapshot:
+            state["house:groups"] = house_snapshot
+            state_write(path, state)
 
     # Official emergency and GAV announcements are prioritized.
     if os.getenv("ANNOUNCEMENTS_ENABLED", "true").lower() == "true":
@@ -541,16 +551,17 @@ async def once():
             for _channel, key, value, message in address_decision(
                     house, state, now, expected=group_id):
                 if key == "address:groups":
-                    # Queue change is handled by the blocking confirmation guard.
-                    state[key] = value
-                    state_write(path, state)
+                    # Only house_queue_transition owns this state key.
                     continue
                 enqueue(1, key, value, message, "address")
         except Exception as exc:
             LOG.warning("Адресні події недоступні: %s", type(exc).__name__)
 
     try:
-        source, groups = await get_schedule()
+        source, groups = await (
+            get_schedule(house_groups) if house_groups is not None
+            else get_schedule()
+        )
     except Exception as exc:
         LOG.error("Графік ДТЕК недоступний: %s", type(exc).__name__)
         source, groups = None, []
