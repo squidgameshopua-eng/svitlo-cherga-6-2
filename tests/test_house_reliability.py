@@ -124,7 +124,7 @@ def test_never_send_home_address_in_queue_change_alert():
     state={}
     _,text = queue_hold(state,verified_groups=["GPV5.1"],selected_group=GROUP,new_code="abc12345")
     assert "Умовна_вулиця" not in text
-    assert "12" not in text
+    assert "12/Г" not in text
     assert "5.1" in text
 
 
