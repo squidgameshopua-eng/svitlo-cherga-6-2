@@ -89,13 +89,16 @@ def queue_hold(state: dict, *, verified_groups: list[str] | tuple[str, ...],
     actual = sorted(set(verified_groups))
     old = state.get("house:queue_hold")
     if old:
+        # A second, verified change during a hold requires a NEW acknowledgment.
+        if actual and actual != old.get("groups"):
+            old["groups"] = actual
+            old["code"] = new_code or secrets.token_hex(4)
+            old["notified"] = False
+            return True, queue_hold_message(old)
         if (approval and approval == old.get("code")
                 and selected_group in actual):
             state.pop("house:queue_hold", None)
             return False, None
-        if selected_group in actual and actual != old.get("groups"):
-            # Require explicit acknowledgment even if a previous group returned.
-            old["groups"] = actual
         if not old.get("notified"):
             return True, queue_hold_message(old)
         return True, None
