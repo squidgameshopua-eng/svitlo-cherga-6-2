@@ -123,8 +123,8 @@ def test_queue_cannot_resume_on_foreign_ack_or_missing_confirmation():
 def test_never_send_home_address_in_queue_change_alert():
     state={}
     _,text = queue_hold(state,verified_groups=["GPV5.1"],selected_group=GROUP,new_code="abc12345")
-    assert "Кропивницького" not in text
-    assert "67" not in text
+    assert "Умовна_вулиця" not in text
+    assert "12" not in text
     assert "5.1" in text
 
 
