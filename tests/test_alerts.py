@@ -133,9 +133,9 @@ def test_stale_news_cannot_trigger_notifications():
 
 
 def test_house_normalization_and_private_address_validation():
-    assert normalized_house("67/А")==normalized_house("67A")
-    assert address_fields('{"city":"місто", "street":"вулиця", "house":"67/А"}')==[
-        "місто","вулиця","67/А"
+    assert normalized_house("12/Г")==normalized_house("12Г")
+    assert address_fields('{"city":"місто", "street":"вулиця", "house":"12/Г"}')==[
+        "місто","вулиця","12/Г"
     ]
     try:
         address_fields('{"city":"місто"}')
@@ -146,10 +146,10 @@ def test_house_normalization_and_private_address_validation():
 
 
 def test_exact_house_selection_without_guessing():
-    response=SimpleNamespace(houses={"67/А":house(), "67/Б":house()})
-    assert get_house_entry(response,"67A") is response.houses["67/А"]
+    response=SimpleNamespace(houses={"12/Г":house(), "12/Е":house()})
+    assert get_house_entry(response,"12Г") is response.houses["12/Г"]
     try:
-        get_house_entry(response,"67/В")
+        get_house_entry(response,"12/Д")
     except RuntimeError:
         pass
     else:
@@ -202,11 +202,11 @@ def test_change_of_house_group_only_after_baseline():
     state={"address:groups":["GPV6.2"]}
     result=address_decision(house(groups=["GPV5.1"]),state,NOW)
     assert any("змінив чергу" in x[3] for x in result if x[3])
-    assert all("Кропивницького" not in x[3] for x in result if x[3])
+    assert all("Умовна_вулиця" not in x[3] for x in result if x[3])
 
 
 def test_public_state_never_contains_address_response_reason():
-    item=house(reason="Планові роботи за приватною адресою 67/А",kind="1",
+    item=house(reason="Планові роботи за приватною адресою 12/Г",kind="1",
                start="08.11.2026 17:00",end="08.11.2026 20:00")
     state={}
     result=address_decision(item,state,NOW)
@@ -216,8 +216,8 @@ def test_public_state_never_contains_address_response_reason():
     assert "event" not in data
     assert "reason" not in data
     assert "address" not in data
-    assert "67/А" not in str(data)
-    assert "67/А" not in str(alerts[0][3])
+    assert "12/Г" not in str(data)
+    assert "12/Г" not in str(alerts[0][3])
     assert "Причина: планові роботи" in alerts[0][3]
 
 
